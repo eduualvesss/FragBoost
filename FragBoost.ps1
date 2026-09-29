@@ -48,10 +48,10 @@ $ErrorActionPreference = "SilentlyContinue"
 # ----------------------- CAMINHOS -----------------------
 $ScriptPath = $PSCommandPath
 if (-not $ScriptPath) { $ScriptPath = $MyInvocation.MyCommand.Path }
-$ScriptDir  = Split-Path -Parent $ScriptPath
+$ScriptDir = Split-Path -Parent $ScriptPath
 $BackupRoot = $ScriptDir
 $ConfigFile = Join-Path $ScriptDir "config.json"
-$IconFile   = Join-Path $ScriptDir "FragBoost.ico"
+$IconFile = Join-Path $ScriptDir "FragBoost.ico"
 
 # ----------------------- POLITICA DE EXECUCAO (auto-fix, 1x por usuario) -----------------------
 # Arquivo baixado da internet cai como bloqueado (Restricted) por padrao no
@@ -65,7 +65,8 @@ try {
     if ((Get-ExecutionPolicy -Scope CurrentUser) -notin @("Bypass", "Unrestricted")) {
         Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope CurrentUser -Force -ErrorAction Stop
     }
-} catch {}
+}
+catch {}
 
 # ----------------------- CONFIG (persistido em config.json) -----------------------
 # Schema: RiotDir (string), RobloxDir (string), CustomGames (lista de
@@ -89,26 +90,27 @@ function Load-Config {
     if (Test-Path $ConfigFile) {
         try {
             $raw = Get-Content $ConfigFile -Raw | ConvertFrom-Json
-            if ($raw.RiotDir)        { $cfg.RiotDir        = $raw.RiotDir }
-            if ($raw.RobloxDir)      { $cfg.RobloxDir      = $raw.RobloxDir }
-            if ($raw.Cs2Dir)         { $cfg.Cs2Dir         = $raw.Cs2Dir }
-            if ($raw.GtaDir)         { $cfg.GtaDir         = $raw.GtaDir }
-            if ($raw.GtaExeName)     { $cfg.GtaExeName     = $raw.GtaExeName }
-            if ($raw.WarframeDir)    { $cfg.WarframeDir    = $raw.WarframeDir }
-            if ($raw.DayzDir)        { $cfg.DayzDir        = $raw.DayzDir }
+            if ($raw.RiotDir) { $cfg.RiotDir = $raw.RiotDir }
+            if ($raw.RobloxDir) { $cfg.RobloxDir = $raw.RobloxDir }
+            if ($raw.Cs2Dir) { $cfg.Cs2Dir = $raw.Cs2Dir }
+            if ($raw.GtaDir) { $cfg.GtaDir = $raw.GtaDir }
+            if ($raw.GtaExeName) { $cfg.GtaExeName = $raw.GtaExeName }
+            if ($raw.WarframeDir) { $cfg.WarframeDir = $raw.WarframeDir }
+            if ($raw.DayzDir) { $cfg.DayzDir = $raw.DayzDir }
             if ($raw.MinecraftJavaw) { $cfg.MinecraftJavaw = $raw.MinecraftJavaw }
             if ($raw.CustomGames) {
                 $cfg.CustomGames = @($raw.CustomGames | ForEach-Object {
-                    [PSCustomObject]@{
-                        Nome    = $_.Nome
-                        ExeName = $_.ExeName
-                        ExePath = $_.ExePath
-                        Dir     = $_.Dir
-                        Slug    = $_.Slug
-                    }
-                })
+                        [PSCustomObject]@{
+                            Nome    = $_.Nome
+                            ExeName = $_.ExeName
+                            ExePath = $_.ExePath
+                            Dir     = $_.Dir
+                            Slug    = $_.Slug
+                        }
+                    })
             }
-        } catch {}
+        }
+        catch {}
     }
     return $cfg
 }
@@ -133,13 +135,23 @@ function Backup-Key([string]$path, [string]$name, [string]$subDir) {
     $dir = Join-Path $BackupRoot $subDir
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     $file = Join-Path $dir "$name.reg"
-    if (Test-Path $file) { return }
+    if (Test-Path $file) { return $true }
     if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
     $regPath = $path.Replace("HKLM:\", "HKLM\").Replace("HKCU:\", "HKCU\")
     reg.exe export "$regPath" "$file" /y *> $null
+    # reg.exe nao lanca excecao, so devolve exit code. Sem checar, falha calada
+    return ($LASTEXITCODE -eq 0 -and (Test-Path $file))
 }
 
 function Set-Reg([string]$path, [string]$name, $value, [string]$type = "DWord") {
+    # dono setado = Apply de uma aba. Guarda o original ANTES de mexer.
+    # Nao conseguiu guardar? Nao escreve. Sem volta, sem mudanca.
+    if ($global:FragOwner) {
+        if (-not (Save-RegOriginal $path $name $global:FragOwner)) {
+            $global:FragFalha = $true
+            return
+        }
+    }
     if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
     New-ItemProperty -Path $path -Name $name -Value $value -PropertyType $type -Force | Out-Null
 }
@@ -163,19 +175,125 @@ function Get-GuidAtivo {
     return Get-Guid $raw
 }
 
-function Save-PowerPlanOriginal([string]$subDir) {
-    $dir  = Join-Path $BackupRoot $subDir
-    $file = Join-Path $dir "power_plan_anterior.txt"
-    if (Test-Path $file) { return }
-    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    $guid = Get-GuidAtivo
-    if ($guid) { Set-Content -Path $file -Value $guid }
+function Save-PowerPlanOriginal([string]$owner) {
+    $state = Load-State
+    # grava o plano original UMA vez. Se o jogo B chegar depois do A, o plano
+    # ativo ja e o Ultimate do A, entao nao pode sobrescrever.
+    if (-not $state.PowerPlan) {
+        $guid = Get-GuidAtivo
+        if (-not $guid) { return }
+        $state.PowerPlan = [PSCustomObject]@{ Guid = $guid; Owners = @() }
+    }
+    if (@($state.PowerPlan.Owners) -notcontains $owner) {
+        $state.PowerPlan.Owners = @($state.PowerPlan.Owners) + $owner
+    }
+    Save-State $state | Out-Null
 }
 
 function Get-SavedPowerPlan([string]$subDir) {
     $file = Join-Path (Join-Path $BackupRoot $subDir) "power_plan_anterior.txt"
     if (Test-Path $file) { return (Get-Content $file).Trim() }
     return $null
+}
+
+# ----------------------- ESTADO GLOBAL (valor original + quem depende dele) -----------------------
+# reg import nao apaga valor que nao existia antes, e o backup por jogo
+# pega o valor que outro jogo ja tinha mexido. Aqui e um arquivo so:
+# cada valor guarda o original UMA vez + lista de abas que usam ele.
+# So restaura quando a ultima aba dona reverte.
+
+$StateFile = Join-Path $BackupRoot "global_backup\state.json"
+$global:FragOwner = $null    # aba que ta aplicando agora (Set-Reg le isso)
+$global:FragFalha = $false   # true se nao deu pra guardar algum original
+
+function Load-State {
+    $s = [PSCustomObject]@{ Regs = @(); PowerPlan = $null }
+    if (Test-Path $StateFile) {
+        try {
+            $raw = Get-Content $StateFile -Raw -ErrorAction Stop | ConvertFrom-Json
+            if ($raw.Regs) { $s.Regs = @($raw.Regs) }
+            if ($raw.PowerPlan) { $s.PowerPlan = $raw.PowerPlan }
+        }
+        catch {
+            # json quebrado: guarda copia, senao o proximo Save apaga os originais
+            Copy-Item $StateFile "$StateFile.corrompido" -Force
+        }
+    }
+    return $s
+}
+
+function Save-State($s) {
+    try {
+        $dir = Split-Path $StateFile
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null }
+        # escreve em .tmp e move: queda no meio da escrita nao deixa json pela metade
+        $tmp = "$StateFile.tmp"
+        $s | ConvertTo-Json -Depth 6 | Set-Content -Path $tmp -Encoding UTF8 -ErrorAction Stop
+        Move-Item -Path $tmp -Destination $StateFile -Force -ErrorAction Stop
+        return $true
+    }
+    catch { return $false }
+}
+
+function Save-RegOriginal([string]$path, [string]$name, [string]$owner) {
+    $state = Load-State
+    $id = "$path|$name"
+    $rec = @($state.Regs) | Where-Object { $_.Id -eq $id } | Select-Object -First 1
+
+    if (-not $rec) {
+        $existed = $false; $kind = $null; $data = $null
+        $key = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        if ($key -and ($key.GetValueNames() -contains $name)) {
+            $existed = $true
+            $kind = $key.GetValueKind($name).ToString()
+            # sem expandir %VAR%, senao restaura o valor ja expandido
+            $data = $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        }
+        $rec = [PSCustomObject]@{ Id = $id; Path = $path; Name = $name; Existed = $existed; Kind = $kind; Data = $data; Owners = @() }
+        $state.Regs = @($state.Regs) + $rec
+    }
+    if (@($rec.Owners) -notcontains $owner) { $rec.Owners = @($rec.Owners) + $owner }
+    return (Save-State $state)
+}
+
+function Restore-Owner([string]$owner) {
+    $global:FragOwner = $null   # restaurar nao pode rastrear de novo
+    $state = Load-State
+    $mexeu = $false
+
+    foreach ($rec in @($state.Regs)) {
+        if (@($rec.Owners) -notcontains $owner) { continue }
+        $mexeu = $true
+        $rec.Owners = @($rec.Owners | Where-Object { $_ -ne $owner })
+        # outra aba ainda depende desse valor: deixa como ta
+        if (@($rec.Owners).Count -gt 0) { continue }
+
+        if ($rec.Existed) {
+            $data = $rec.Data
+            if ($rec.Kind -eq "Binary") { $data = [byte[]]$data }
+            if ($rec.Kind -eq "MultiString") { $data = [string[]]$data }
+            Set-Reg $rec.Path $rec.Name $data $rec.Kind
+        }
+        else {
+            Remove-Reg $rec.Path $rec.Name
+        }
+    }
+    $state.Regs = @($state.Regs | Where-Object { @($_.Owners).Count -gt 0 })
+
+    $pp = $state.PowerPlan
+    if ($pp -and (@($pp.Owners) -contains $owner)) {
+        $mexeu = $true
+        $pp.Owners = @($pp.Owners | Where-Object { $_ -ne $owner })
+        if (@($pp.Owners).Count -eq 0) {
+            powercfg /setactive $pp.Guid *> $null
+            # plano original pode ter sido apagado pelo usuario
+            if ($LASTEXITCODE -ne 0) { powercfg /setactive SCHEME_BALANCED *> $null }
+            $state.PowerPlan = $null
+        }
+    }
+
+    Save-State $state | Out-Null
+    return $mexeu
 }
 
 # ----------------------- ATALHO SEM UAC (app inteiro, um so pra tudo) -----------------------
@@ -193,30 +311,30 @@ function Test-AtalhoInstalado {
 
 function New-Atalho {
     Import-Module ScheduledTasks -ErrorAction SilentlyContinue
-    $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`""
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`""
     $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest -LogonType Interactive
-    $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
 
     Unregister-ScheduledTask -TaskName $AtalhoTaskName -Confirm:$false -ErrorAction SilentlyContinue
     Register-ScheduledTask -TaskName $AtalhoTaskName -Action $action -Principal $principal -Settings $settings | Out-Null
 
-    $desktop      = [Environment]::GetFolderPath("Desktop")
+    $desktop = [Environment]::GetFolderPath("Desktop")
     $shortcutPath = Join-Path $desktop "FragBoost.lnk"
-    $wsh          = New-Object -ComObject WScript.Shell
-    $shortcut     = $wsh.CreateShortcut($shortcutPath)
-    $shortcut.TargetPath       = Join-Path $env:WINDIR "System32\schtasks.exe"
-    $shortcut.Arguments        = "/run /tn `"$AtalhoTaskName`""
+    $wsh = New-Object -ComObject WScript.Shell
+    $shortcut = $wsh.CreateShortcut($shortcutPath)
+    $shortcut.TargetPath = Join-Path $env:WINDIR "System32\schtasks.exe"
+    $shortcut.Arguments = "/run /tn `"$AtalhoTaskName`""
     $shortcut.WorkingDirectory = $ScriptDir
-    $shortcut.WindowStyle      = 7
-    $shortcut.IconLocation     = if (Test-Path $IconFile) { $IconFile } else { (Join-Path $env:WINDIR "System32\shell32.dll") + ",13" }
-    $shortcut.Description      = "Abre o FragBoost direto como administrador"
+    $shortcut.WindowStyle = 7
+    $shortcut.IconLocation = if (Test-Path $IconFile) { $IconFile } else { (Join-Path $env:WINDIR "System32\shell32.dll") + ",13" }
+    $shortcut.Description = "Abre o FragBoost direto como administrador"
     $shortcut.Save()
 }
 
 function Remove-Atalho {
     Import-Module ScheduledTasks -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $AtalhoTaskName -Confirm:$false -ErrorAction SilentlyContinue
-    $desktop      = [Environment]::GetFolderPath("Desktop")
+    $desktop = [Environment]::GetFolderPath("Desktop")
     $shortcutPath = Join-Path $desktop "FragBoost.lnk"
     if (Test-Path $shortcutPath) { Remove-Item $shortcutPath -Force }
 }
@@ -238,7 +356,8 @@ if (-not $isAdmin) {
         Start-Process -FilePath "powershell.exe" `
             -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", "`"$ScriptPath`"") `
             -Verb RunAs -ErrorAction Stop | Out-Null
-    } catch {
+    }
+    catch {
         [System.Windows.Forms.MessageBox]::Show(
             "Precisa de permissao de administrador. Clique com o botao direito no arquivo e escolha 'Executar com PowerShell', e aceite o UAC.",
             "FragBoost") | Out-Null
@@ -261,10 +380,10 @@ function Get-SteamLibraryPaths {
     # fora do disco padrao nunca seria achado.
     $bases = @()
     foreach ($regPath in @(
-        "HKCU:\Software\Valve\Steam",
-        "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam",
-        "HKLM:\SOFTWARE\Valve\Steam"
-    )) {
+            "HKCU:\Software\Valve\Steam",
+            "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam",
+            "HKLM:\SOFTWARE\Valve\Steam"
+        )) {
         $v = Get-Reg $regPath "SteamPath"
         if (-not $v) { $v = Get-Reg $regPath "InstallPath" }
         if ($v -and (Test-Path $v)) { $bases += $v }
@@ -322,7 +441,8 @@ function Find-EpicGameByExe([string]$ExeNome) {
                 $exePath = Join-Path $dados.InstallLocation $dados.LaunchExecutable
                 if (Test-Path $exePath) { return @{ ExePath = $exePath; GameDir = $dados.InstallLocation } }
             }
-        } catch {}
+        }
+        catch {}
     }
     return $null
 }
@@ -349,7 +469,7 @@ function Find-RobloxExe([string]$baseDir) {
     $versionsDir = Join-Path $baseDir "Versions"
     if (-not (Test-Path $versionsDir)) { return $null }
     $found = Get-ChildItem -Path $versionsDir -Filter "RobloxPlayerBeta.exe" -Recurse -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if ($found) { return $found.FullName }
     return $null
 }
@@ -397,10 +517,10 @@ function Find-WarframeExe {
     if ($r) { $r.ExeName = "Warframe.x64.exe"; return $r }
 
     foreach ($raiz in @(
-        (Join-Path ${env:ProgramFiles(x86)} "Warframe"),
-        (Join-Path $env:ProgramFiles "Warframe"),
-        (Join-Path $env:LOCALAPPDATA "Warframe")
-    )) {
+            (Join-Path ${env:ProgramFiles(x86)} "Warframe"),
+            (Join-Path $env:ProgramFiles "Warframe"),
+            (Join-Path $env:LOCALAPPDATA "Warframe")
+        )) {
         if (-not $raiz) { continue }
         $tentativa = Join-Path $raiz "Downloaded\Public\Warframe.x64.exe"
         if (Test-Path $tentativa) { return @{ ExePath = $tentativa; GameDir = $raiz; ExeName = "Warframe.x64.exe" } }
@@ -425,7 +545,7 @@ function Find-MinecraftJavaw([string]$MinecraftDir) {
     $runtimeDir = Join-Path $MinecraftDir "runtime"
     if (-not (Test-Path $runtimeDir)) { return $null }
     $achado = Get-ChildItem -Path $runtimeDir -Filter "javaw.exe" -Recurse -ErrorAction SilentlyContinue |
-        Select-Object -First 1
+    Select-Object -First 1
     if ($achado) { return $achado.FullName }
     return $null
 }
@@ -438,23 +558,32 @@ function Find-MinecraftJavaw([string]$MinecraftDir) {
 
 $BG_HOGS = @(
     "Spotify",
-    "chrome","msedge","firefox","opera","brave",
-    "EpicGamesLauncher","EAApp","Origin","Battle.net",
-    "Steam","OneDrive","Dropbox","Teams","Slack","skype"
+    "chrome", "msedge", "firefox", "opera", "brave",
+    "EpicGamesLauncher", "EAApp", "Origin", "Battle.net",
+    "Steam", "OneDrive", "Dropbox", "Teams", "Slack", "skype"
 )
+
+# IFEO e indexado por NOME de exe. Nome generico = prioridade alta pra
+# todo programa da maquina que usa esse nome.
+$IFEO_BLOCKLIST = @(
+    "java.exe", "javaw.exe", "python.exe", "pythonw.exe", "node.exe", "dotnet.exe",
+    "chrome.exe", "msedge.exe", "firefox.exe", "explorer.exe", "cmd.exe",
+    "powershell.exe", "pwsh.exe", "launcher.exe", "game.exe", "start.exe",
+    "setup.exe", "install.exe", "steam.exe", "electron.exe"
+)   
 
 $ULTIMATE_GUID = "e9a42b02-d5df-448d-aa00-03f14749eb61"
 
 # Chaves de registro globais usadas pela otimizacao universal de jogos
 # (nao mudam de jogo pra jogo - so o IFEO e a exclusao no Defender sao
 # por executavel/pasta).
-$G_MMCSS_KEY   = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
-$G_GAMES_KEY   = "$G_MMCSS_KEY\Tasks\Games"
-$G_GFXDRV_KEY  = "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers"
-$G_LAYERS_KEY  = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+$G_MMCSS_KEY = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
+$G_GAMES_KEY = "$G_MMCSS_KEY\Tasks\Games"
+$G_GFXDRV_KEY = "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers"
+$G_LAYERS_KEY = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
 $G_GAMECFG_KEY = "HKCU:\System\GameConfigStore"
 $G_GAMEDVR_KEY = "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR"
-$G_BGAPPS_KEY  = "HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications"
+$G_BGAPPS_KEY = "HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications"
 $G_GAMEBAR_KEY = "HKCU:\Software\Microsoft\GameBar"
 
 # ----------------------- OTIMIZACAO UNIVERSAL (qualquer jogo) -----------------------
@@ -470,6 +599,22 @@ $G_GAMEBAR_KEY = "HKCU:\Software\Microsoft\GameBar"
 # funcao retornasse (mesmo motivo do .GetNewClosure() ja usado em
 # New-DragHandler nas versoes antigas).
 
+function Test-PastaExclusaoSegura([string]$dir) {
+    if (-not $dir -or -not (Test-Path $dir)) { return $false }
+    $full = [IO.Path]::GetFullPath($dir).TrimEnd("\")
+    # raiz de disco ("C:") tem 2 chars
+    if ($full.Length -le 3) { return $false }
+    # so bloqueia a pasta exata. Subpasta do Downloads e ok, o Downloads em si nao.
+    $largas = @(
+        [Environment]::GetFolderPath("Desktop"), [Environment]::GetFolderPath("MyDocuments"),
+        (Join-Path $env:USERPROFILE "Downloads"), $env:USERPROFILE, $env:TEMP,
+        $env:LOCALAPPDATA, $env:APPDATA, $env:ProgramFiles, ${env:ProgramFiles(x86)},
+        $env:WINDIR, "C:\Users", "C:\ProgramData"
+    ) | Where-Object { $_ } | ForEach-Object { $_.TrimEnd("\") }
+    foreach ($p in $largas) { if ($full -ieq $p) { return $false } }
+    return $true
+}
+
 function Get-UniversalGameTweaks {
     param(
         [string]$ExeName,
@@ -484,107 +629,113 @@ function Get-UniversalGameTweaks {
         [switch]$SkipCpuPriority
     )
 
+    if ($IFEO_BLOCKLIST -contains "$ExeName".ToLower()) { $SkipCpuPriority = $true }
+
     $ifeoKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\$ExeName\PerfOptions"
 
     $tweaksBase = @(
-        @{ Label = "Desativar Game DVR"
-           StatusCheck = { (Get-Reg $G_GAMECFG_KEY "GameDVR_Enabled") -eq 0 }.GetNewClosure()
-           Apply = {
-               Backup-Key $G_GAMECFG_KEY "gameconfigstore" $BackupSub
-               Backup-Key $G_GAMEDVR_KEY "gamedvr" $BackupSub
-               Set-Reg $G_GAMECFG_KEY "GameDVR_Enabled" 0
-               Set-Reg $G_GAMEDVR_KEY "AppCaptureEnabled" 0
-           }.GetNewClosure()
+        @{ Label        = "Desativar Game DVR"
+            StatusCheck = { (Get-Reg $G_GAMECFG_KEY "GameDVR_Enabled") -eq 0 }.GetNewClosure()
+            Apply       = {
+                Backup-Key $G_GAMECFG_KEY "gameconfigstore" $BackupSub
+                Backup-Key $G_GAMEDVR_KEY "gamedvr" $BackupSub
+                Set-Reg $G_GAMECFG_KEY "GameDVR_Enabled" 0
+                Set-Reg $G_GAMEDVR_KEY "AppCaptureEnabled" 0
+            }.GetNewClosure()
         },
-        @{ Label = "Ativar Game Mode"
-           StatusCheck = { (Get-Reg $G_GAMEBAR_KEY "AutoGameModeEnabled") -eq 1 }.GetNewClosure()
-           Apply = {
-               Set-Reg $G_GAMEBAR_KEY "AllowAutoGameMode" 1
-               Set-Reg $G_GAMEBAR_KEY "AutoGameModeEnabled" 1
-           }.GetNewClosure()
+        @{ Label        = "Ativar Game Mode"
+            StatusCheck = { (Get-Reg $G_GAMEBAR_KEY "AutoGameModeEnabled") -eq 1 }.GetNewClosure()
+            Apply       = {
+                Set-Reg $G_GAMEBAR_KEY "AllowAutoGameMode" 1
+                Set-Reg $G_GAMEBAR_KEY "AutoGameModeEnabled" 1
+            }.GetNewClosure()
         },
-        @{ Label = "Fullscreen exclusivo classico"
-           StatusCheck = { (Get-Reg $G_GAMECFG_KEY "GameDVR_FSEBehaviorMode") -eq 2 }.GetNewClosure()
-           Apply = {
-               Backup-Key $G_GAMECFG_KEY "gameconfigstore" $BackupSub
-               Backup-Key $G_LAYERS_KEY "layers" $BackupSub
-               Set-Reg $G_GAMECFG_KEY "GameDVR_FSEBehaviorMode" 2
-               Set-Reg $G_GAMECFG_KEY "GameDVR_HonorUserFSEBehaviorMode" 1
-               Set-Reg $G_GAMECFG_KEY "GameDVR_DXGIHonorFSEWindowsCompatible" 1
-               if (Test-Path $ExePath) {
-                   Set-Reg $G_LAYERS_KEY $ExePath "~ DISABLEDXMAXIMIZEDWINDOWEDMODE" "String"
-               }
-           }.GetNewClosure()
+        @{ Label        = "Fullscreen exclusivo classico"
+            StatusCheck = { (Get-Reg $G_GAMECFG_KEY "GameDVR_FSEBehaviorMode") -eq 2 }.GetNewClosure()
+            Apply       = {
+                Backup-Key $G_GAMECFG_KEY "gameconfigstore" $BackupSub
+                Backup-Key $G_LAYERS_KEY "layers" $BackupSub
+                Set-Reg $G_GAMECFG_KEY "GameDVR_FSEBehaviorMode" 2
+                Set-Reg $G_GAMECFG_KEY "GameDVR_HonorUserFSEBehaviorMode" 1
+                Set-Reg $G_GAMECFG_KEY "GameDVR_DXGIHonorFSEWindowsCompatible" 1
+                if (Test-Path $ExePath) {
+                    Set-Reg $G_LAYERS_KEY $ExePath "~ DISABLEDXMAXIMIZEDWINDOWEDMODE" "String"
+                }
+            }.GetNewClosure()
         },
-        @{ Label = "Ajustar MMCSS (rede/CPU p/ jogos)"
-           StatusCheck = { (Get-Reg $G_MMCSS_KEY "SystemResponsiveness") -eq 0 }.GetNewClosure()
-           Apply = {
-               Backup-Key $G_MMCSS_KEY "systemprofile" $BackupSub
-               Set-Reg $G_MMCSS_KEY "NetworkThrottlingIndex" 0xffffffff
-               Set-Reg $G_MMCSS_KEY "SystemResponsiveness" 0
-               Set-Reg $G_GAMES_KEY "GPU Priority" 8
-               Set-Reg $G_GAMES_KEY "Priority" 6
-               Set-Reg $G_GAMES_KEY "Scheduling Category" "High" "String"
-               Set-Reg $G_GAMES_KEY "SFIO Priority" "High" "String"
-           }.GetNewClosure()
+        @{ Label        = "Ajustar MMCSS (rede/CPU p/ jogos)"
+            StatusCheck = { (Get-Reg $G_MMCSS_KEY "SystemResponsiveness") -eq 0 }.GetNewClosure()
+            Apply       = {
+                Backup-Key $G_MMCSS_KEY "systemprofile" $BackupSub
+                Set-Reg $G_MMCSS_KEY "NetworkThrottlingIndex" 0xffffffff
+                Set-Reg $G_MMCSS_KEY "SystemResponsiveness" 0
+                Set-Reg $G_GAMES_KEY "GPU Priority" 8
+                Set-Reg $G_GAMES_KEY "Priority" 6
+                Set-Reg $G_GAMES_KEY "Scheduling Category" "High" "String"
+                Set-Reg $G_GAMES_KEY "SFIO Priority" "High" "String"
+            }.GetNewClosure()
         },
-        @{ Label = "Excluir pasta do jogo do Defender"
-           StatusCheck = { (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath -contains $GameDir }.GetNewClosure()
-           Apply = {
-               try { Add-MpPreference -ExclusionPath $GameDir -ErrorAction Stop } catch {}
-           }.GetNewClosure()
+        @{ Label        = "Excluir pasta do jogo do Defender"
+            StatusCheck = { (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath -contains $GameDir }.GetNewClosure()
+            Apply       = {
+                if (-not (Test-PastaExclusaoSegura $GameDir)) {
+                    [System.Windows.Forms.MessageBox]::Show("Pasta ampla demais pra excluir do Defender:`n$GameDir`nMove o jogo pra uma pasta so dele.", "FragBoost") | Out-Null
+                    return
+                }
+                try { Add-MpPreference -ExclusionPath $GameDir -ErrorAction Stop } catch {}
+            }.GetNewClosure()
         },
-        @{ Label = "Bloquear apps UWP em 2o plano"
-           StatusCheck = { (Get-Reg $G_BGAPPS_KEY "GlobalUserDisabled") -eq 1 }.GetNewClosure()
-           Apply = {
-               Backup-Key $G_BGAPPS_KEY "bgapps" $BackupSub
-               Set-Reg $G_BGAPPS_KEY "GlobalUserDisabled" 1
-           }.GetNewClosure()
+        @{ Label        = "Bloquear apps UWP em 2o plano"
+            StatusCheck = { (Get-Reg $G_BGAPPS_KEY "GlobalUserDisabled") -eq 1 }.GetNewClosure()
+            Apply       = {
+                Backup-Key $G_BGAPPS_KEY "bgapps" $BackupSub
+                Set-Reg $G_BGAPPS_KEY "GlobalUserDisabled" 1
+            }.GetNewClosure()
         },
-        @{ Label = "Ultimate Performance (energia)"
-           StatusCheck = { (powercfg /getactivescheme | Out-String) -match "Ultimate Performance" }.GetNewClosure()
-           Apply = {
-               Save-PowerPlanOriginal $BackupSub
-               $dupTxt = powercfg /duplicatescheme $ULTIMATE_GUID | Out-String
-               $novoGuid = Get-Guid $dupTxt
-               if ($novoGuid) { powercfg /setactive $novoGuid }
-           }.GetNewClosure()
+        @{ Label        = "Ultimate Performance (energia)"
+            StatusCheck = { (powercfg /getactivescheme | Out-String) -match "Ultimate Performance" }.GetNewClosure()
+            Apply       = {
+                Save-PowerPlanOriginal $BackupSub
+                $dupTxt = powercfg /duplicatescheme $ULTIMATE_GUID | Out-String
+                $novoGuid = Get-Guid $dupTxt
+                if ($novoGuid) { powercfg /setactive $novoGuid }
+            }.GetNewClosure()
         },
-        @{ Label = "GPU Scheduling (HAGS)"
-           StatusCheck = { (Get-Reg $G_GFXDRV_KEY "HwSchMode") -eq 2 }.GetNewClosure()
-           Apply = {
-               Backup-Key $G_GFXDRV_KEY "graphicsdrivers" $BackupSub
-               Set-Reg $G_GFXDRV_KEY "HwSchMode" 2
-           }.GetNewClosure()
+        @{ Label        = "GPU Scheduling (HAGS)"
+            StatusCheck = { (Get-Reg $G_GFXDRV_KEY "HwSchMode") -eq 2 }.GetNewClosure()
+            Apply       = {
+                Backup-Key $G_GFXDRV_KEY "graphicsdrivers" $BackupSub
+                Set-Reg $G_GFXDRV_KEY "HwSchMode" 2
+            }.GetNewClosure()
         },
-        @{ Label = "Desativar Nagle (rede)"
-           StatusCheck = {
-               $r = $false
-               Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | ForEach-Object {
-                   $p = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$($_.InterfaceGuid)"
-                   if ((Get-Reg $p "TcpAckFrequency") -eq 1) { $r = $true }
-               }
-               $r
-           }.GetNewClosure()
-           Apply = {
-               Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | ForEach-Object {
-                   $guid = $_.InterfaceGuid
-                   $ifPath = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$guid"
-                   if (Test-Path $ifPath) {
-                       Backup-Key $ifPath "nagle_$guid" $BackupSub
-                       Set-Reg $ifPath "TcpAckFrequency" 1
-                       Set-Reg $ifPath "TCPNoDelay" 1
-                   }
-               }
-           }.GetNewClosure()
+        @{ Label        = "Desativar Nagle (rede)"
+            StatusCheck = {
+                $r = $false
+                Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | ForEach-Object {
+                    $p = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$($_.InterfaceGuid)"
+                    if ((Get-Reg $p "TcpAckFrequency") -eq 1) { $r = $true }
+                }
+                $r
+            }.GetNewClosure()
+            Apply       = {
+                Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | ForEach-Object {
+                    $guid = $_.InterfaceGuid
+                    $ifPath = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$guid"
+                    if (Test-Path $ifPath) {
+                        Backup-Key $ifPath "nagle_$guid" $BackupSub
+                        Set-Reg $ifPath "TcpAckFrequency" 1
+                        Set-Reg $ifPath "TCPNoDelay" 1
+                    }
+                }
+            }.GetNewClosure()
         }
     )
 
     if ($SkipCpuPriority) { return $tweaksBase }
 
     $cpuTweak = @{ Label = "Prioridade alta de CPU ($ExeName)"
-        StatusCheck = { (Get-Reg $ifeoKey "CpuPriorityClass") -eq 3 }.GetNewClosure()
-        Apply = {
+        StatusCheck      = { (Get-Reg $ifeoKey "CpuPriorityClass") -eq 3 }.GetNewClosure()
+        Apply            = {
             Backup-Key $ifeoKey "ifeo" $BackupSub
             Set-Reg $ifeoKey "CpuPriorityClass" 3
         }.GetNewClosure()
@@ -599,6 +750,14 @@ function Reset-UniversalGameDefaults {
         [string]$ExeName, [string]$ExePath, [string]$GameDir, [string]$BackupSub,
         [switch]$SkipCpuPriority
     )
+
+    if ($IFEO_BLOCKLIST -contains "$ExeName".ToLower()) { $SkipCpuPriority = $true }
+
+    # Defender e por pasta (nao e global), sai sempre
+    try { Remove-MpPreference -ExclusionPath $GameDir -ErrorAction Stop } catch {}
+    # tem original guardado: usa ele e nao chuta padrao
+    if (Restore-Owner $BackupSub) { return }
+    # daqui pra baixo: legado (aba que nunca passou pelo estado novo)
 
     $ifeoKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\$ExeName\PerfOptions"
 
@@ -636,26 +795,26 @@ function Reset-UniversalGameDefaults {
 # Mesma paleta/tipografia das versoes anteriores - identidade unica
 # pra suite inteira.
 
-$formWidth  = 900
+$formWidth = 900
 $formHeight = 640
-$titleBarH  = 30
-$catBarH    = 44
-$contentWidth  = $formWidth
+$titleBarH = 30
+$catBarH = 44
+$contentWidth = $formWidth
 $contentHeight = $formHeight - $titleBarH - $catBarH
 
-$colorBg      = [System.Drawing.Color]::FromArgb(255, 8, 8, 10)
-$colorPanel   = [System.Drawing.Color]::FromArgb(255, 18, 18, 21)
-$colorCard    = [System.Drawing.Color]::FromArgb(255, 22, 22, 26)
-$colorAccent  = [System.Drawing.Color]::FromArgb(255, 255, 70, 85)
-$colorText    = [System.Drawing.Color]::WhiteSmoke
-$colorMuted   = [System.Drawing.Color]::FromArgb(255, 150, 150, 155)
-$colorOk      = [System.Drawing.Color]::FromArgb(255, 90, 220, 130)
+$colorBg = [System.Drawing.Color]::FromArgb(255, 8, 8, 10)
+$colorPanel = [System.Drawing.Color]::FromArgb(255, 18, 18, 21)
+$colorCard = [System.Drawing.Color]::FromArgb(255, 22, 22, 26)
+$colorAccent = [System.Drawing.Color]::FromArgb(255, 255, 70, 85)
+$colorText = [System.Drawing.Color]::WhiteSmoke
+$colorMuted = [System.Drawing.Color]::FromArgb(255, 150, 150, 155)
+$colorOk = [System.Drawing.Color]::FromArgb(255, 90, 220, 130)
 $colorSideSel = [System.Drawing.Color]::FromArgb(255, 38, 38, 46)
-$colorBorder  = [System.Drawing.Color]::FromArgb(255, 58, 58, 66)
+$colorBorder = [System.Drawing.Color]::FromArgb(255, 58, 58, 66)
 
-$btnRadius  = 6
+$btnRadius = 6
 $cardRadius = 8
-$winRadius  = 10
+$winRadius = 10
 
 # Segoe UI Variable Text e a fonte nativa do Windows 11 - letras mais
 # arredondadas e "macias" que a Segoe UI classica, sem precisar embutir
@@ -667,16 +826,17 @@ function Get-SafeFontFamily {
     try {
         $coll = New-Object System.Drawing.Text.InstalledFontCollection
         if ($coll.Families.Name -contains $prefer) { return $prefer }
-    } catch {}
+    }
+    catch {}
     return "Segoe UI"
 }
 $fontFamilyName = Get-SafeFontFamily
 
 $fontTitle = New-Object System.Drawing.Font($fontFamilyName, 16, [System.Drawing.FontStyle]::Bold)
-$fontBtn   = New-Object System.Drawing.Font($fontFamilyName, 9, [System.Drawing.FontStyle]::Bold)
-$fontItem  = New-Object System.Drawing.Font($fontFamilyName, 9)
+$fontBtn = New-Object System.Drawing.Font($fontFamilyName, 9, [System.Drawing.FontStyle]::Bold)
+$fontItem = New-Object System.Drawing.Font($fontFamilyName, 9)
 $fontSmall = New-Object System.Drawing.Font($fontFamilyName, 8)
-$fontMono  = New-Object System.Drawing.Font("Consolas", 9)
+$fontMono = New-Object System.Drawing.Font("Consolas", 9)
 $fontTileMono = New-Object System.Drawing.Font($fontFamilyName, 11, [System.Drawing.FontStyle]::Bold)
 
 # ----------------------- CANTOS ARREDONDADOS (GDI+, anti-serrilhado) -----------------------
@@ -707,13 +867,13 @@ function New-CardPanel([int]$x, [int]$y, [int]$w, [int]$h, [System.Drawing.Color
     $p.Size = New-Object System.Drawing.Size($w, $h)
     $p.BackColor = $ParentBg
     $p.Add_Paint({
-        param($s, $e)
-        $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-        $path = New-RoundedPath $s.Width $s.Height $cardRadius
-        $brush = New-Object System.Drawing.SolidBrush($Fill)
-        $e.Graphics.FillPath($brush, $path)
-        $brush.Dispose(); $path.Dispose()
-    }.GetNewClosure())
+            param($s, $e)
+            $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $path = New-RoundedPath $s.Width $s.Height $cardRadius
+            $brush = New-Object System.Drawing.SolidBrush($Fill)
+            $e.Graphics.FillPath($brush, $path)
+            $brush.Dispose(); $path.Dispose()
+        }.GetNewClosure())
     return $p
 }
 
@@ -725,18 +885,18 @@ function New-CardPanel([int]$x, [int]$y, [int]$w, [int]$h, [System.Drawing.Color
 # arredondada com botao de titulo reto, entao segue o padrao real do SO.
 function Set-RoundedForm([System.Windows.Forms.Form]$f, [int]$radius) {
     $f.Add_Load({
-        $path = New-RoundedPath $this.Width $this.Height $radius
-        $this.Region = New-Object System.Drawing.Region($path)
-        $path.Dispose()
-    }.GetNewClosure())
+            $path = New-RoundedPath $this.Width $this.Height $radius
+            $this.Region = New-Object System.Drawing.Region($path)
+            $path.Dispose()
+        }.GetNewClosure())
     $f.Add_Paint({
-        param($s, $e)
-        $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-        $path = New-RoundedPath $s.Width $s.Height $radius
-        $pen = New-Object System.Drawing.Pen($colorBorder, 1)
-        $e.Graphics.DrawPath($pen, $path)
-        $pen.Dispose(); $path.Dispose()
-    }.GetNewClosure())
+            param($s, $e)
+            $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $path = New-RoundedPath $s.Width $s.Height $radius
+            $pen = New-Object System.Drawing.Pen($colorBorder, 1)
+            $e.Graphics.DrawPath($pen, $path)
+            $pen.Dispose(); $path.Dispose()
+        }.GetNewClosure())
 }
 
 Add-Type -Name "WindowDrag" -Namespace "NativeMethods" -MemberDefinition '
@@ -770,7 +930,8 @@ function Write-ButtonLabel($btn, $g, [System.Drawing.Color]$color) {
     if ($btn.TextAlign.ToString() -like "*Left") {
         $flags = $flags -bor $F::Left
         $pad = 14
-    } else {
+    }
+    else {
         $flags = $flags -bor $F::HorizontalCenter
     }
     $rect = New-Object System.Drawing.Rectangle($pad, 0, ($btn.Width - 2 * $pad), $btn.Height)
@@ -790,15 +951,15 @@ function New-ActionButton([string]$text, [int]$y, [int]$width = 150, [System.Dra
     $b.Location = New-Object System.Drawing.Point(15, $y)
     $b.Size = New-Object System.Drawing.Size($width, 36)
     $b.Add_Paint({
-        param($s, $e)
-        Clear-ButtonSurface $s $e.Graphics
-        $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-        $path = New-RoundedPath $s.Width $s.Height $btnRadius
-        $pen = New-Object System.Drawing.Pen($colorAccent, 1)
-        $e.Graphics.DrawPath($pen, $path)
-        Write-ButtonLabel $s $e.Graphics $s.ForeColor
-        $pen.Dispose(); $path.Dispose()
-    })
+            param($s, $e)
+            Clear-ButtonSurface $s $e.Graphics
+            $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $path = New-RoundedPath $s.Width $s.Height $btnRadius
+            $pen = New-Object System.Drawing.Pen($colorAccent, 1)
+            $e.Graphics.DrawPath($pen, $path)
+            Write-ButtonLabel $s $e.Graphics $s.ForeColor
+            $pen.Dispose(); $path.Dispose()
+        })
     return $b
 }
 
@@ -853,7 +1014,7 @@ function New-TweaksPanel {
         $panel.Controls.Add($lnkVoltar)
     }
 
-    $leftW  = 180
+    $leftW = 180
     $gbLeft = New-CardPanel 15 40 $leftW ($Height - 55) $colorBg $colorCard
     $panel.Controls.Add($gbLeft)
 
@@ -939,144 +1100,165 @@ function New-TweaksPanel {
     $btnApply.Location = New-Object System.Drawing.Point(10, ($gbRight.Height - 42))
     $btnApply.Size = New-Object System.Drawing.Size(($rightW - 20), 36)
     $btnApply.Add_Paint({
-        param($s, $e)
-        Clear-ButtonSurface $s $e.Graphics
-        $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-        $path = New-RoundedPath $s.Width $s.Height $btnRadius
-        $brush = New-Object System.Drawing.SolidBrush($colorAccent)
-        $e.Graphics.FillPath($brush, $path)
-        Write-ButtonLabel $s $e.Graphics $s.ForeColor
-        $brush.Dispose(); $path.Dispose()
-    })
+            param($s, $e)
+            Clear-ButtonSurface $s $e.Graphics
+            $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $path = New-RoundedPath $s.Width $s.Height $btnRadius
+            $brush = New-Object System.Drawing.SolidBrush($colorAccent)
+            $e.Graphics.FillPath($brush, $path)
+            Write-ButtonLabel $s $e.Graphics $s.ForeColor
+            $brush.Dispose(); $path.Dispose()
+        })
     $gbRight.Controls.Add($btnApply)
 
     $btnApply.Add_Click({
-        $any = $false
-        foreach ($t in $Tweaks) {
-            if ($t.Control.Checked) { & $t.Apply; $any = $true }
-        }
-        if ($any) {
-            [System.Windows.Forms.MessageBox]::Show("Ajustes aplicados. Reinicie o PC pra tudo valer.", "FragBoost") | Out-Null
-        } else {
-            [System.Windows.Forms.MessageBox]::Show("Nenhum ajuste selecionado.", "FragBoost") | Out-Null
-        }
-    }.GetNewClosure())
+            $any = $false
+            $global:FragOwner = $BackupSubDir
+            $global:FragFalha = $false
+            try {
+                foreach ($t in $Tweaks) {
+                    if ($t.Control.Checked) { & $t.Apply; $any = $true }
+                }
+            }
+            finally {
+                $global:FragOwner = $null
+            }
+            if ($global:FragFalha) {
+                [System.Windows.Forms.MessageBox]::Show("Nao deu pra guardar o valor original de algum ajuste. Esse ajuste NAO foi aplicado. Confere permissao da pasta global_backup.", "FragBoost") | Out-Null
+                return
+            }
+            if ($any) {
+                [System.Windows.Forms.MessageBox]::Show("Ajustes aplicados. Reinicie o PC pra tudo valer.", "FragBoost") | Out-Null
+            }
+            else {
+                [System.Windows.Forms.MessageBox]::Show("Nenhum ajuste selecionado.", "FragBoost") | Out-Null
+            }
+        }.GetNewClosure())
 
     $btnStatus.Add_Click({
-        foreach ($t in $Tweaks) { $t.Control.Checked = [bool](& $t.StatusCheck) }
-        & $refreshInfo
+            foreach ($t in $Tweaks) { $t.Control.Checked = [bool](& $t.StatusCheck) }
+            & $refreshInfo
 
-        $sf = New-Object System.Windows.Forms.Form
-        $sf.Text = "Status"
-        $sf.Size = New-Object System.Drawing.Size(440, 480)
-        $sf.StartPosition = "CenterParent"
-        $sf.FormBorderStyle = "None"
-        $sf.BackColor = $colorBg
-        $sf.ForeColor = $colorText
-        Set-RoundedForm $sf $cardRadius
+            $sf = New-Object System.Windows.Forms.Form
+            $sf.Text = "Status"
+            $sf.Size = New-Object System.Drawing.Size(440, 480)
+            $sf.StartPosition = "CenterParent"
+            $sf.FormBorderStyle = "None"
+            $sf.BackColor = $colorBg
+            $sf.ForeColor = $colorText
+            Set-RoundedForm $sf $cardRadius
 
-        $statusDrag = New-DragHandler $sf
+            $statusDrag = New-DragHandler $sf
 
-        $bar = New-Object System.Windows.Forms.Panel
-        $bar.Size = New-Object System.Drawing.Size(440, 30)
-        $bar.BackColor = $colorPanel
-        $bar.Add_MouseDown($statusDrag)
-        $sf.Controls.Add($bar)
+            $bar = New-Object System.Windows.Forms.Panel
+            $bar.Size = New-Object System.Drawing.Size(440, 30)
+            $bar.BackColor = $colorPanel
+            $bar.Add_MouseDown($statusDrag)
+            $sf.Controls.Add($bar)
 
-        $lblBar = New-Object System.Windows.Forms.Label
-        $lblBar.Text = "STATUS - $HeaderText"
-        $lblBar.Font = $fontBtn
-        $lblBar.ForeColor = $colorMuted
-        $lblBar.Location = New-Object System.Drawing.Point(12, 6)
-        $lblBar.Size = New-Object System.Drawing.Size(320, 20)
-        $lblBar.Add_MouseDown($statusDrag)
-        $bar.Controls.Add($lblBar)
+            $lblBar = New-Object System.Windows.Forms.Label
+            $lblBar.Text = "STATUS - $HeaderText"
+            $lblBar.Font = $fontBtn
+            $lblBar.ForeColor = $colorMuted
+            $lblBar.Location = New-Object System.Drawing.Point(12, 6)
+            $lblBar.Size = New-Object System.Drawing.Size(320, 20)
+            $lblBar.Add_MouseDown($statusDrag)
+            $bar.Controls.Add($lblBar)
 
-        $btnCloseStatus = New-Object System.Windows.Forms.Button
-        $btnCloseStatus.Text = "X"
-        $btnCloseStatus.FlatStyle = "Flat"
-        $btnCloseStatus.FlatAppearance.BorderSize = 0
-        $btnCloseStatus.BackColor = $colorAccent
-        $btnCloseStatus.ForeColor = [System.Drawing.Color]::White
-        $btnCloseStatus.Size = New-Object System.Drawing.Size(30, 30)
-        $btnCloseStatus.Location = New-Object System.Drawing.Point(410, 0)
-        $btnCloseStatus.Add_Click({ $sf.Close() }.GetNewClosure())
-        $bar.Controls.Add($btnCloseStatus)
+            $btnCloseStatus = New-Object System.Windows.Forms.Button
+            $btnCloseStatus.Text = "X"
+            $btnCloseStatus.FlatStyle = "Flat"
+            $btnCloseStatus.FlatAppearance.BorderSize = 0
+            $btnCloseStatus.BackColor = $colorAccent
+            $btnCloseStatus.ForeColor = [System.Drawing.Color]::White
+            $btnCloseStatus.Size = New-Object System.Drawing.Size(30, 30)
+            $btnCloseStatus.Location = New-Object System.Drawing.Point(410, 0)
+            $btnCloseStatus.Add_Click({ $sf.Close() }.GetNewClosure())
+            $bar.Controls.Add($btnCloseStatus)
 
-        $listBox = New-Object System.Windows.Forms.Panel
-        $listBox.Location = New-Object System.Drawing.Point(15, 40)
-        $listBox.Size = New-Object System.Drawing.Size(410, 340)
-        $listBox.AutoScroll = $true
-        $sf.Controls.Add($listBox)
+            $listBox = New-Object System.Windows.Forms.Panel
+            $listBox.Location = New-Object System.Drawing.Point(15, 40)
+            $listBox.Size = New-Object System.Drawing.Size(410, 340)
+            $listBox.AutoScroll = $true
+            $sf.Controls.Add($listBox)
 
-        $sy = 0
-        foreach ($t in $Tweaks) {
-            $ativo = [bool](& $t.StatusCheck)
+            $sy = 0
+            foreach ($t in $Tweaks) {
+                $ativo = [bool](& $t.StatusCheck)
 
-            $lbl = New-Object System.Windows.Forms.Label
-            $lbl.Text = $t.Label
-            $lbl.Font = $fontItem
-            $lbl.ForeColor = $colorText
-            $lbl.Location = New-Object System.Drawing.Point(0, $sy)
-            $lbl.Size = New-Object System.Drawing.Size(280, 30)
-            $listBox.Controls.Add($lbl)
+                $lbl = New-Object System.Windows.Forms.Label
+                $lbl.Text = $t.Label
+                $lbl.Font = $fontItem
+                $lbl.ForeColor = $colorText
+                $lbl.Location = New-Object System.Drawing.Point(0, $sy)
+                $lbl.Size = New-Object System.Drawing.Size(280, 30)
+                $listBox.Controls.Add($lbl)
 
-            $tag = New-Object System.Windows.Forms.Label
-            $tag.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
-            $tag.TextAlign = "MiddleRight"
-            $tag.Location = New-Object System.Drawing.Point(285, $sy)
-            $tag.Size = New-Object System.Drawing.Size(100, 20)
-            if ($ativo) { $tag.Text = "ATIVO"; $tag.ForeColor = $colorOk }
-            else { $tag.Text = "INATIVO"; $tag.ForeColor = $colorMuted }
-            $listBox.Controls.Add($tag)
+                $tag = New-Object System.Windows.Forms.Label
+                $tag.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
+                $tag.TextAlign = "MiddleRight"
+                $tag.Location = New-Object System.Drawing.Point(285, $sy)
+                $tag.Size = New-Object System.Drawing.Size(100, 20)
+                if ($ativo) { $tag.Text = "ATIVO"; $tag.ForeColor = $colorOk }
+                else { $tag.Text = "INATIVO"; $tag.ForeColor = $colorMuted }
+                $listBox.Controls.Add($tag)
 
-            $sy += 34
-        }
+                $sy += 34
+            }
 
-        $infoY = 390
-        foreach ($linha in (& $InfoLines)) {
-            $l = New-Object System.Windows.Forms.Label
-            $l.Text = $linha
-            $l.Font = $fontItem
-            $l.ForeColor = $colorMuted
-            $l.Location = New-Object System.Drawing.Point(15, $infoY)
-            $l.Size = New-Object System.Drawing.Size(410, 20)
-            $sf.Controls.Add($l)
-            $infoY += 20
-        }
+            $infoY = 390
+            foreach ($linha in (& $InfoLines)) {
+                $l = New-Object System.Windows.Forms.Label
+                $l.Text = $linha
+                $l.Font = $fontItem
+                $l.ForeColor = $colorMuted
+                $l.Location = New-Object System.Drawing.Point(15, $infoY)
+                $l.Size = New-Object System.Drawing.Size(410, 20)
+                $sf.Controls.Add($l)
+                $infoY += 20
+            }
 
-        $sf.ShowDialog() | Out-Null
-    }.GetNewClosure())
+            $sf.ShowDialog() | Out-Null
+        }.GetNewClosure())
 
     $btnRevert.Add_Click({
-        $r = [System.Windows.Forms.MessageBox]::Show(
-            "Sim = restaurar backup exato de antes.`nNao = resetar pro padrao aproximado do Windows.",
-            "Reverter", "YesNoCancel")
+            $r = [System.Windows.Forms.MessageBox]::Show(
+                "Sim = restaurar backup exato de antes.`nNao = resetar pro padrao aproximado do Windows.",
+                "Reverter", "YesNoCancel")
 
-        $bdir = Join-Path $BackupRoot $BackupSubDir
+            $bdir = Join-Path $BackupRoot $BackupSubDir
 
-        if ($r -eq "Yes") {
-            if (Test-Path $bdir) {
-                Get-ChildItem -Path $bdir -Filter "*.reg" | ForEach-Object { reg.exe import "$($_.FullName)" *> $null }
-                $guidSalvo = Get-SavedPowerPlan $BackupSubDir
-                if ($guidSalvo) { powercfg /setactive $guidSalvo }
-                foreach ($t in $Tweaks) { $t.Control.Checked = [bool](& $t.StatusCheck) }
-                & $refreshInfo
-                [System.Windows.Forms.MessageBox]::Show("Backup restaurado. Reinicie o PC.", "Reverter") | Out-Null
-            } else {
-                [System.Windows.Forms.MessageBox]::Show("Nenhum backup encontrado.", "Reverter") | Out-Null
+            if ($r -eq "Yes") {
+                if (Restore-Owner $BackupSubDir) {
+                    foreach ($t in $Tweaks) { $t.Control.Checked = [bool](& $t.StatusCheck) }
+                    & $refreshInfo
+                    [System.Windows.Forms.MessageBox]::Show("Valores originais restaurados. Reinicie o PC.", "Reverter") | Out-Null
+                }
+                elseif (Test-Path $bdir) {
+                    # legado: aba que so passou pela versao antiga
+                    Get-ChildItem -Path $bdir -Filter "*.reg" | ForEach-Object { reg.exe import "$($_.FullName)" *> $null }
+                    $guidSalvo = Get-SavedPowerPlan $BackupSubDir
+                    if ($guidSalvo) { powercfg /setactive $guidSalvo }
+                    foreach ($t in $Tweaks) { $t.Control.Checked = [bool](& $t.StatusCheck) }
+                    & $refreshInfo
+                    [System.Windows.Forms.MessageBox]::Show("Backup restaurado. Reinicie o PC.", "Reverter") | Out-Null
+                }
+                else {
+                    [System.Windows.Forms.MessageBox]::Show("Nenhum backup encontrado.", "Reverter") | Out-Null
+                }
             }
-        } elseif ($r -eq "No") {
-            if ($ResetDefaults) {
-                & $ResetDefaults
-                foreach ($t in $Tweaks) { $t.Control.Checked = [bool](& $t.StatusCheck) }
-                & $refreshInfo
-                [System.Windows.Forms.MessageBox]::Show("Resetado pro padrao aproximado. Reinicie o PC.", "Reverter") | Out-Null
-            } else {
-                [System.Windows.Forms.MessageBox]::Show("Sem reset padrao definido pra esta aba - use Sim pra restaurar do backup.", "Reverter") | Out-Null
+            elseif ($r -eq "No") {
+                if ($ResetDefaults) {
+                    & $ResetDefaults
+                    foreach ($t in $Tweaks) { $t.Control.Checked = [bool](& $t.StatusCheck) }
+                    & $refreshInfo
+                    [System.Windows.Forms.MessageBox]::Show("Resetado pro padrao aproximado. Reinicie o PC.", "Reverter") | Out-Null
+                }
+                else {
+                    [System.Windows.Forms.MessageBox]::Show("Sem reset padrao definido pra esta aba - use Sim pra restaurar do backup.", "Reverter") | Out-Null
+                }
             }
-        }
-    }.GetNewClosure())
+        }.GetNewClosure())
 
     return $panel
 }
@@ -1092,7 +1274,8 @@ function New-BoostAction([string]$procName, [string]$backupSub) {
         $proc = Get-Process -Name $procName -ErrorAction SilentlyContinue
         if ($proc) {
             try { $proc.PriorityClass = "High"; $msgLines += "Prioridade do processo elevada" } catch {}
-        } else {
+        }
+        else {
             $msgLines += "Jogo nao esta rodando agora"
         }
 
@@ -1129,12 +1312,12 @@ function New-BoostAction([string]$procName, [string]$backupSub) {
 # quem localiza manualmente (pelo card na grade) e o usuario, quando quiser.
 
 $RiotDir = $Cfg.RiotDir
-$ValExe  = Join-Path $RiotDir $RelValorantExe
+$ValExe = Join-Path $RiotDir $RelValorantExe
 if (-not (Test-Path $ValExe)) {
     $riotRoot = Find-RiotProductRoot "valorant.live"
     if ($riotRoot) {
         $RiotDir = $riotRoot
-        $ValExe  = Join-Path $RiotDir $RelValorantExe
+        $ValExe = Join-Path $RiotDir $RelValorantExe
         $Cfg.RiotDir = $RiotDir
         Save-Config $Cfg
     }
@@ -1144,8 +1327,8 @@ $ValExeName = "VALORANT-Win64-Shipping.exe"
 $ValorantTweaks = Get-UniversalGameTweaks -ExeName $ValExeName -ExePath $ValExe -GameDir $RiotDir -BackupSub "valorant_backup"
 
 $valorantInfo = {
-    $achou     = if (Test-Path $ValExe) { "VALORANT encontrado" } else { "VALORANT nao encontrado" }
-    $defAtivo  = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath -contains $RiotDir
+    $achou = if (Test-Path $ValExe) { "VALORANT encontrado" } else { "VALORANT nao encontrado" }
+    $defAtivo = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath -contains $RiotDir
     $defStatus = if ($defAtivo) { "Defender: pasta excluida" } else { "Defender: sem exclusao" }
     @($achou, $defStatus)
 }
@@ -1165,15 +1348,15 @@ $PanelValorant = New-TweaksPanel -Width $contentWidth -Height $contentHeight `
 # proximo jogo da biblioteca, como pedido.
 
 $RobloxDir = $Cfg.RobloxDir
-$RbxExe    = Find-RobloxExe $RobloxDir
+$RbxExe = Find-RobloxExe $RobloxDir
 if (-not $RbxExe) { $RbxExe = Join-Path $RobloxDir "RobloxPlayerBeta.exe" }
 $RbxExeName = "RobloxPlayerBeta.exe"
 
 $RobloxTweaks = Get-UniversalGameTweaks -ExeName $RbxExeName -ExePath $RbxExe -GameDir $RobloxDir -BackupSub "roblox_backup"
 
 $robloxInfo = {
-    $achou     = if (Test-Path $RbxExe) { "Roblox encontrado" } else { "Roblox nao encontrado" }
-    $defAtivo  = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath -contains $RobloxDir
+    $achou = if (Test-Path $RbxExe) { "Roblox encontrado" } else { "Roblox nao encontrado" }
+    $defAtivo = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath -contains $RobloxDir
     $defStatus = if ($defAtivo) { "Defender: pasta excluida" } else { "Defender: sem exclusao" }
     @($achou, $defStatus)
 }
@@ -1204,14 +1387,14 @@ $McExeName = "javaw.exe"
 $MinecraftTweaks = Get-UniversalGameTweaks -ExeName $McExeName -ExePath $McJavaw -GameDir $MinecraftDir -BackupSub "minecraft_backup" -SkipCpuPriority
 
 $minecraftInfo = {
-    $achou     = if (Test-Path $McJavaw) { "Executavel encontrado (javaw.exe)" } else { "Executavel nao encontrado" }
-    $defAtivo  = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath -contains $MinecraftDir
+    $achou = if (Test-Path $McJavaw) { "Executavel encontrado (javaw.exe)" } else { "Executavel nao encontrado" }
+    $defAtivo = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath -contains $MinecraftDir
     $defStatus = if ($defAtivo) { "Defender: pasta excluida" } else { "Defender: sem exclusao" }
     @($achou, $defStatus, "Prioridade de CPU fica de fora (javaw.exe e nome generico)")
 }
 
 $minecraftRamAction = {
-    $totalGB  = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
+    $totalGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
     $sugestao = [math]::Max(2, [math]::Min($totalGB - 4, [math]::Floor($totalGB / 2)))
     [System.Windows.Forms.MessageBox]::Show(
         "RAM total detectada: ${totalGB}GB.`nSugestao de alocacao maxima (-Xmx): ${sugestao}GB.`n`nCola esse valor em: Launcher oficial > Instalacoes > editar > Mais opcoes > argumentos da JVM (-Xmx${sugestao}G).",
@@ -1255,8 +1438,8 @@ $Cs2ExeName = "cs2.exe"
 $Cs2Tweaks = Get-UniversalGameTweaks -ExeName $Cs2ExeName -ExePath $Cs2Exe -GameDir $Cs2Dir -BackupSub "cs2_backup"
 
 $cs2Info = {
-    $achou     = if (Test-Path $Cs2Exe) { "CS2 encontrado" } else { "CS2 nao encontrado" }
-    $defAtivo  = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath -contains $Cs2Dir
+    $achou = if (Test-Path $Cs2Exe) { "CS2 encontrado" } else { "CS2 nao encontrado" }
+    $defAtivo = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath -contains $Cs2Dir
     $defStatus = if ($defAtivo) { "Defender: pasta excluida" } else { "Defender: sem exclusao" }
     @($achou, $defStatus)
 }
@@ -1276,7 +1459,8 @@ $cs2ShaderCacheAction = {
     }
     if ($limpas.Count -gt 0) {
         [System.Windows.Forms.MessageBox]::Show("Cache de shaders limpo em:`n$($limpas -join "`n")`nO driver recompila sozinho na proxima execucao (pode dar uns segundos de engasgo so na primeira vez).", "Limpar cache de shaders") | Out-Null
-    } else {
+    }
+    else {
         [System.Windows.Forms.MessageBox]::Show("Nenhuma pasta de cache de shader encontrada.", "Limpar cache de shaders") | Out-Null
     }
 }
@@ -1300,9 +1484,9 @@ $PanelCs2 = New-TweaksPanel -Width $contentWidth -Height $contentHeight `
 # streaming de asset, entao prioridade de disco alta ajuda mais aqui do
 # que num mapa pequeno tipo CS2.
 
-$GtaDir     = $Cfg.GtaDir
+$GtaDir = $Cfg.GtaDir
 $GtaExeName = $Cfg.GtaExeName
-$GtaExe     = if ($GtaDir -and $GtaExeName) { Join-Path $GtaDir $GtaExeName } else { $null }
+$GtaExe = if ($GtaDir -and $GtaExeName) { Join-Path $GtaDir $GtaExeName } else { $null }
 if (-not $GtaExe -or -not (Test-Path $GtaExe)) {
     $achado = Find-GtaExe
     if ($achado) {
@@ -1311,23 +1495,23 @@ if (-not $GtaExe -or -not (Test-Path $GtaExe)) {
         Save-Config $Cfg
     }
 }
-if (-not $GtaDir)     { $GtaDir = "C:\Program Files (x86)\Steam\steamapps\common\Grand Theft Auto V" }
+if (-not $GtaDir) { $GtaDir = "C:\Program Files (x86)\Steam\steamapps\common\Grand Theft Auto V" }
 if (-not $GtaExeName) { $GtaExeName = "GTA5.exe" }
-if (-not $GtaExe)     { $GtaExe = Join-Path $GtaDir $GtaExeName }
+if (-not $GtaExe) { $GtaExe = Join-Path $GtaDir $GtaExeName }
 
 $GtaTweaks = Get-UniversalGameTweaks -ExeName $GtaExeName -ExePath $GtaExe -GameDir $GtaDir -BackupSub "gta_backup"
 $gtaIfeoKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\$GtaExeName\PerfOptions"
 $GtaTweaks += @{ Label = "Prioridade de E/S alta (streaming de mundo aberto)"
-    StatusCheck = { (Get-Reg $gtaIfeoKey "IoPriority") -eq 3 }.GetNewClosure()
-    Apply = {
+    StatusCheck        = { (Get-Reg $gtaIfeoKey "IoPriority") -eq 3 }.GetNewClosure()
+    Apply              = {
         Backup-Key $gtaIfeoKey "ifeo" "gta_backup"
         Set-Reg $gtaIfeoKey "IoPriority" 3
     }.GetNewClosure()
 }
 
 $gtaInfo = {
-    $achou     = if (Test-Path $GtaExe) { "GTA V encontrado ($GtaExeName)" } else { "GTA V nao encontrado" }
-    $defAtivo  = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath -contains $GtaDir
+    $achou = if (Test-Path $GtaExe) { "GTA V encontrado ($GtaExeName)" } else { "GTA V nao encontrado" }
+    $defAtivo = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath -contains $GtaDir
     $defStatus = if ($defAtivo) { "Defender: pasta excluida" } else { "Defender: sem exclusao" }
     @($achou, $defStatus)
 }
@@ -1359,14 +1543,14 @@ if (-not $WfExe -or -not (Test-Path $WfExe)) {
     }
 }
 if (-not $WarframeDir) { $WarframeDir = "C:\Program Files (x86)\Steam\steamapps\common\Warframe" }
-if (-not $WfExe)       { $WfExe = Join-Path $WarframeDir "Downloaded\Public\Warframe.x64.exe" }
+if (-not $WfExe) { $WfExe = Join-Path $WarframeDir "Downloaded\Public\Warframe.x64.exe" }
 $WfExeName = "Warframe.x64.exe"
 
 $WarframeTweaks = Get-UniversalGameTweaks -ExeName $WfExeName -ExePath $WfExe -GameDir $WarframeDir -BackupSub "warframe_backup"
 
 $warframeInfo = {
-    $achou     = if (Test-Path $WfExe) { "Warframe encontrado" } else { "Warframe nao encontrado" }
-    $defAtivo  = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath -contains $WarframeDir
+    $achou = if (Test-Path $WfExe) { "Warframe encontrado" } else { "Warframe nao encontrado" }
+    $defAtivo = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath -contains $WarframeDir
     $defStatus = if ($defAtivo) { "Defender: pasta excluida" } else { "Defender: sem exclusao" }
     @($achou, $defStatus)
 }
@@ -1376,7 +1560,8 @@ $warframeCacheAction = {
     if (Test-Path $cache) {
         Remove-Item -Path (Join-Path $cache "*") -Recurse -Force -ErrorAction SilentlyContinue
         [System.Windows.Forms.MessageBox]::Show("Cache do motor limpo. O launcher reconstroi sozinho na proxima verificacao de arquivos.", "Limpar cache") | Out-Null
-    } else {
+    }
+    else {
         [System.Windows.Forms.MessageBox]::Show("Pasta de cache nao encontrada (Cache.Windows).", "Limpar cache") | Out-Null
     }
 }.GetNewClosure()
@@ -1417,16 +1602,16 @@ $DayzExeName = "DayZ_x64.exe"
 $DayzTweaks = Get-UniversalGameTweaks -ExeName $DayzExeName -ExePath $DayzExe -GameDir $DayzDir -BackupSub "dayz_backup"
 $dayzIfeoKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\$DayzExeName\PerfOptions"
 $DayzTweaks += @{ Label = "Prioridade de E/S alta (streaming de terreno)"
-    StatusCheck = { (Get-Reg $dayzIfeoKey "IoPriority") -eq 3 }.GetNewClosure()
-    Apply = {
+    StatusCheck         = { (Get-Reg $dayzIfeoKey "IoPriority") -eq 3 }.GetNewClosure()
+    Apply               = {
         Backup-Key $dayzIfeoKey "ifeo" "dayz_backup"
         Set-Reg $dayzIfeoKey "IoPriority" 3
     }.GetNewClosure()
 }
 
 $dayzInfo = {
-    $achou     = if (Test-Path $DayzExe) { "DayZ encontrado" } else { "DayZ nao encontrado" }
-    $defAtivo  = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath -contains $DayzDir
+    $achou = if (Test-Path $DayzExe) { "DayZ encontrado" } else { "DayZ nao encontrado" }
+    $defAtivo = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath -contains $DayzDir
     $defStatus = if ($defAtivo) { "Defender: pasta excluida" } else { "Defender: sem exclusao" }
     @($achou, $defStatus, "Usa BattlEye - ajustes daqui sao so registro, nada injeta no processo")
 }
@@ -1445,95 +1630,99 @@ $PanelDayz = New-TweaksPanel -Width $contentWidth -Height $contentHeight `
 # Copiado do Otimizador-de-CPU-GUI.ps1 original - ajustes de sistema,
 # nao dependem de nenhum jogo especifico.
 
-$CPU_PRIORITY_KEY      = "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl"
+$CPU_PRIORITY_KEY = "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl"
 $CPU_POWERTHROTTLE_KEY = "HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling"
 $CPU_ALTO_DESEMPENHO_GUID = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
 
 $SERVICOS_STRESS = @(
-    @{ Nome = "SysMain";   Descricao = "Superfetch" },
+    @{ Nome = "SysMain"; Descricao = "Superfetch" },
     @{ Nome = "DiagTrack"; Descricao = "Telemetria da Microsoft" },
-    @{ Nome = "WSearch";   Descricao = "Indexacao de busca do Windows" }
+    @{ Nome = "WSearch"; Descricao = "Indexacao de busca do Windows" }
 )
 
 $ProcessosProtegidos = @("System", "Idle", "csrss", "wininit", "services", "lsass", "winlogon", "smss", "svchost", "Registry", "Memory Compression")
 
 $CpuTweaks = @(
-    @{ Label = "Desempenho Maximo (energia + core parking)"
-       StatusCheck = {
-           $t = (powercfg /getactivescheme | Out-String)
-           ($t -match "Ultimate Performance") -or ($t -match [regex]::Escape($CPU_ALTO_DESEMPENHO_GUID))
-       }
-       Apply = {
-           Save-PowerPlanOriginal "cpu_backup"
-           $guidAlvo = $null
-           $planos = (powercfg /list | Out-String)
-           if ($planos -match "([0-9a-fA-F-]{36})\s*\(Ultimate Performance\)") { $guidAlvo = $Matches[1] }
-           if (-not $guidAlvo) {
-               $dupTxt = (powercfg /duplicatescheme $ULTIMATE_GUID | Out-String)
-               $guidAlvo = Get-Guid $dupTxt
-           }
-           if (-not $guidAlvo) { $guidAlvo = $CPU_ALTO_DESEMPENHO_GUID }
+    @{ Label        = "Desempenho Maximo (energia + core parking)"
+        StatusCheck = {
+            $t = (powercfg /getactivescheme | Out-String)
+            ($t -match "Ultimate Performance") -or ($t -match [regex]::Escape($CPU_ALTO_DESEMPENHO_GUID))
+        }
+        Apply       = {
+            Save-PowerPlanOriginal "cpu_backup"
+            $guidAlvo = $null
+            $planos = (powercfg /list | Out-String)
+            if ($planos -match "([0-9a-fA-F-]{36})\s*\(Ultimate Performance\)") { $guidAlvo = $Matches[1] }
+            if (-not $guidAlvo) {
+                $dupTxt = (powercfg /duplicatescheme $ULTIMATE_GUID | Out-String)
+                $guidAlvo = Get-Guid $dupTxt
+            }
+            if (-not $guidAlvo) { $guidAlvo = $CPU_ALTO_DESEMPENHO_GUID }
 
-           powercfg /setactive $guidAlvo
-           powercfg -setacvalueindex $guidAlvo SUB_PROCESSOR CPMINCORES 100
-           powercfg -setacvalueindex $guidAlvo SUB_PROCESSOR CPMAXCORES 100
-           powercfg -setdcvalueindex $guidAlvo SUB_PROCESSOR CPMINCORES 100
-           powercfg -setdcvalueindex $guidAlvo SUB_PROCESSOR CPMAXCORES 100
-           powercfg -S $guidAlvo
-       }
+            powercfg /setactive $guidAlvo
+            powercfg -setacvalueindex $guidAlvo SUB_PROCESSOR CPMINCORES 100
+            powercfg -setacvalueindex $guidAlvo SUB_PROCESSOR CPMAXCORES 100
+            powercfg -setdcvalueindex $guidAlvo SUB_PROCESSOR CPMINCORES 100
+            powercfg -setdcvalueindex $guidAlvo SUB_PROCESSOR CPMAXCORES 100
+            powercfg -S $guidAlvo
+        }
     },
-    @{ Label = "Prioridade de foreground (Win32PrioritySeparation)"
-       StatusCheck = { (Get-Reg $CPU_PRIORITY_KEY "Win32PrioritySeparation") -eq 38 }
-       Apply = {
-           Backup-Key $CPU_PRIORITY_KEY "prioritycontrol" "cpu_backup"
-           Set-Reg $CPU_PRIORITY_KEY "Win32PrioritySeparation" 38
-       }
+    @{ Label        = "Prioridade de foreground (Win32PrioritySeparation)"
+        StatusCheck = { (Get-Reg $CPU_PRIORITY_KEY "Win32PrioritySeparation") -eq 38 }
+        Apply       = {
+            Backup-Key $CPU_PRIORITY_KEY "prioritycontrol" "cpu_backup"
+            Set-Reg $CPU_PRIORITY_KEY "Win32PrioritySeparation" 38
+        }
     },
-    @{ Label = "MMCSS sem reserva de CPU (SystemResponsiveness)"
-       StatusCheck = { (Get-Reg $G_MMCSS_KEY "SystemResponsiveness") -eq 0 }
-       Apply = {
-           Backup-Key $G_MMCSS_KEY "systemprofile" "cpu_backup"
-           Set-Reg $G_MMCSS_KEY "SystemResponsiveness" 0
-       }
+    @{ Label        = "MMCSS sem reserva de CPU (SystemResponsiveness)"
+        StatusCheck = { (Get-Reg $G_MMCSS_KEY "SystemResponsiveness") -eq 0 }
+        Apply       = {
+            Backup-Key $G_MMCSS_KEY "systemprofile" "cpu_backup"
+            Set-Reg $G_MMCSS_KEY "SystemResponsiveness" 0
+        }
     },
-    @{ Label = "Power Throttling off + clock travado 100%"
-       StatusCheck = { (Get-Reg $CPU_POWERTHROTTLE_KEY "PowerThrottlingOff") -eq 1 }
-       Apply = {
-           Save-PowerPlanOriginal "cpu_backup"
-           Backup-Key $CPU_POWERTHROTTLE_KEY "powerthrottling" "cpu_backup"
-           Set-Reg $CPU_POWERTHROTTLE_KEY "PowerThrottlingOff" 1
-           $g = Get-GuidAtivo
-           if ($g) {
-               powercfg -setacvalueindex $g SUB_PROCESSOR PROCTHROTTLEMAX 100
-               powercfg -setacvalueindex $g SUB_PROCESSOR PROCTHROTTLEMIN 100
-               powercfg -setdcvalueindex $g SUB_PROCESSOR PROCTHROTTLEMAX 100
-               powercfg -setdcvalueindex $g SUB_PROCESSOR PROCTHROTTLEMIN 100
-               powercfg -S $g
-           }
-       }
+    @{ Label        = "Power Throttling off + clock travado 100%"
+        StatusCheck = { (Get-Reg $CPU_POWERTHROTTLE_KEY "PowerThrottlingOff") -eq 1 }
+        Apply       = {
+            Save-PowerPlanOriginal "cpu_backup"
+            Backup-Key $CPU_POWERTHROTTLE_KEY "powerthrottling" "cpu_backup"
+            Set-Reg $CPU_POWERTHROTTLE_KEY "PowerThrottlingOff" 1
+            $g = Get-GuidAtivo
+            if ($g) {
+                powercfg -setacvalueindex $g SUB_PROCESSOR PROCTHROTTLEMAX 100
+                powercfg -setacvalueindex $g SUB_PROCESSOR PROCTHROTTLEMIN 100
+                powercfg -setdcvalueindex $g SUB_PROCESSOR PROCTHROTTLEMAX 100
+                powercfg -setdcvalueindex $g SUB_PROCESSOR PROCTHROTTLEMIN 100
+                powercfg -S $g
+            }
+        }
     },
-    @{ Label = "Servicos em 2o plano desativados (SysMain/DiagTrack/WSearch)"
-       StatusCheck = {
-           $todos = $true
-           foreach ($s in $SERVICOS_STRESS) {
-               $svc = Get-Service -Name $s.Nome -ErrorAction SilentlyContinue
-               if (-not $svc -or $svc.StartType -ne "Disabled") { $todos = $false }
-           }
-           $todos
-       }
-       Apply = {
-           foreach ($s in $SERVICOS_STRESS) {
-               $svc = Get-Service -Name $s.Nome -ErrorAction SilentlyContinue
-               if (-not $svc) { continue }
-               Backup-Key "HKLM:\SYSTEM\CurrentControlSet\Services\$($s.Nome)" "svc_$($s.Nome)" "cpu_backup"
-               if ($svc.Status -eq "Running") { Stop-Service -Name $s.Nome -Force -ErrorAction SilentlyContinue }
-               Set-Service -Name $s.Nome -StartupType Disabled -ErrorAction SilentlyContinue
-           }
-       }
+    @{ Label        = "Servicos em 2o plano desativados (SysMain/DiagTrack/WSearch)"
+        StatusCheck = {
+            $todos = $true
+            foreach ($s in $SERVICOS_STRESS) {
+                $svc = Get-Service -Name $s.Nome -ErrorAction SilentlyContinue
+                if (-not $svc -or $svc.StartType -ne "Disabled") { $todos = $false }
+            }
+            $todos
+        }
+        Apply       = {
+            foreach ($s in $SERVICOS_STRESS) {
+                $svc = Get-Service -Name $s.Nome -ErrorAction SilentlyContinue
+                if (-not $svc) { continue }
+                $svcKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$($s.Nome)"
+                if (-not (Save-RegOriginal $svcKey "Start" $global:FragOwner)) { $global:FragFalha = $true; continue }
+                Save-RegOriginal $svcKey "DelayedAutostart" $global:FragOwner | Out-Null
+                Backup-Key $svcKey "svc_$($s.Nome)" "cpu_backup"
+                if ($svc.Status -eq "Running") { Stop-Service -Name $s.Nome -Force -ErrorAction SilentlyContinue }
+                Set-Service -Name $s.Nome -StartupType Disabled -ErrorAction SilentlyContinue
+            }
+        }
     }
 )
 
 function Reset-CpuDefaults {
+    if (Restore-Owner "cpu_backup") { return }
     Set-Reg $CPU_PRIORITY_KEY "Win32PrioritySeparation" 2
     Set-Reg $G_MMCSS_KEY "SystemResponsiveness" 20
     Remove-Reg $CPU_POWERTHROTTLE_KEY "PowerThrottlingOff"
@@ -1613,9 +1802,9 @@ function Show-ProcessCleanupWindow {
     $pf.Controls.Add($lv)
 
     $processos = Get-Process |
-        Where-Object { $_.CPU -gt 0 -and ($ProcessosProtegidos -notcontains $_.ProcessName) } |
-        Sort-Object CPU -Descending |
-        Select-Object -First 20
+    Where-Object { $_.CPU -gt 0 -and ($ProcessosProtegidos -notcontains $_.ProcessName) } |
+    Sort-Object CPU -Descending |
+    Select-Object -First 20
 
     foreach ($p in $processos) {
         $item = New-Object System.Windows.Forms.ListViewItem($p.ProcessName)
@@ -1636,30 +1825,32 @@ function Show-ProcessCleanupWindow {
     $btnKill.Location = New-Object System.Drawing.Point(15, 378)
     $btnKill.Size = New-Object System.Drawing.Size(415, 36)
     $btnKill.Add_Paint({
-        param($s, $e)
-        Clear-ButtonSurface $s $e.Graphics
-        $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-        $path = New-RoundedPath $s.Width $s.Height $btnRadius
-        $brush = New-Object System.Drawing.SolidBrush($colorAccent)
-        $e.Graphics.FillPath($brush, $path)
-        Write-ButtonLabel $s $e.Graphics $s.ForeColor
-        $brush.Dispose(); $path.Dispose()
-    })
+            param($s, $e)
+            Clear-ButtonSurface $s $e.Graphics
+            $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $path = New-RoundedPath $s.Width $s.Height $btnRadius
+            $brush = New-Object System.Drawing.SolidBrush($colorAccent)
+            $e.Graphics.FillPath($brush, $path)
+            Write-ButtonLabel $s $e.Graphics $s.ForeColor
+            $brush.Dispose(); $path.Dispose()
+        })
     $btnKill.Add_Click({
-        $mortos = @()
-        foreach ($item in $lv.CheckedItems) {
-            try {
-                Stop-Process -Id $item.Tag -Force -ErrorAction Stop
-                $mortos += $item.Text
-            } catch {}
-        }
-        if ($mortos.Count -gt 0) {
-            [System.Windows.Forms.MessageBox]::Show("Encerrado: $($mortos -join ', ')", "Limpeza de processos") | Out-Null
-        } else {
-            [System.Windows.Forms.MessageBox]::Show("Nenhum processo selecionado.", "Limpeza de processos") | Out-Null
-        }
-        $pf.Close()
-    }.GetNewClosure())
+            $mortos = @()
+            foreach ($item in $lv.CheckedItems) {
+                try {
+                    Stop-Process -Id $item.Tag -Force -ErrorAction Stop
+                    $mortos += $item.Text
+                }
+                catch {}
+            }
+            if ($mortos.Count -gt 0) {
+                [System.Windows.Forms.MessageBox]::Show("Encerrado: $($mortos -join ', ')", "Limpeza de processos") | Out-Null
+            }
+            else {
+                [System.Windows.Forms.MessageBox]::Show("Nenhum processo selecionado.", "Limpeza de processos") | Out-Null
+            }
+            $pf.Close()
+        }.GetNewClosure())
     $pf.Controls.Add($btnKill)
 
     $pNote = New-Object System.Windows.Forms.Label
@@ -1714,7 +1905,7 @@ function New-ActionsPanel {
     $header.Padding = New-Object System.Windows.Forms.Padding(15, 0, 0, 0)
     $panel.Controls.Add($header)
 
-    $leftW  = 270
+    $leftW = 270
     $gbLeft = New-CardPanel 15 40 $leftW ($Height - 55) $colorBg $colorCard
     $panel.Controls.Add($gbLeft)
 
@@ -1766,14 +1957,14 @@ function New-ActionsPanel {
         $b.Height = 44
         $b.TextAlign = "MiddleLeft"
         $b.Add_Click({
-            $rtb.Clear()
-            $resultado = & $tool.Action
-            & $appendLog $resultado
-            $cancelado = ($resultado.Count -gt 0) -and ($resultado[-1].Text -eq "Cancelado.")
-            if (-not $cancelado) {
-                [System.Windows.Forms.MessageBox]::Show("Feito.", "FragBoost") | Out-Null
-            }
-        }.GetNewClosure())
+                $rtb.Clear()
+                $resultado = & $tool.Action
+                & $appendLog $resultado
+                $cancelado = ($resultado.Count -gt 0) -and ($resultado[-1].Text -eq "Cancelado.")
+                if (-not $cancelado) {
+                    [System.Windows.Forms.MessageBox]::Show("Feito.", "FragBoost") | Out-Null
+                }
+            }.GetNewClosure())
         $gbLeft.Controls.Add($b)
         $y += 52
     }
@@ -1797,7 +1988,7 @@ function New-ActionsPanel {
 
 function Get-TopRamProcesses {
     $rows = Get-Process | Sort-Object WS -Descending | Select-Object -First 15 ProcessName, Id,
-        @{ Name = 'RAM_MB'; Expression = { [math]::Round($_.WS / 1MB, 1) } }
+    @{ Name = 'RAM_MB'; Expression = { [math]::Round($_.WS / 1MB, 1) } }
     $log = @(@{ Text = ("{0,-24}{1,-8}{2,10}" -f "PROCESSO", "PID", "RAM(MB)"); Color = $colorMuted })
     foreach ($r in $rows) {
         $log += @{ Text = ("{0,-24}{1,-8}{2,10}" -f $r.ProcessName, $r.Id, $r.RAM_MB); Color = $colorText }
@@ -1860,12 +2051,15 @@ public static int PurgeStandbyList() {
         $status = [RamBoost.MemPurge]::PurgeStandbyList()
         if ($status -eq 0) {
             $log += @{ Text = " - cache liberado, sobrou mais memoria livre pro trim usar."; Color = $colorOk }
-        } elseif (-not ($p1 -or $p2)) {
+        }
+        elseif (-not ($p1 -or $p2)) {
             $log += @{ Text = " - conta nao tem o privilegio necessario habilitado (mesmo como admin). Codigo: $status"; Color = $colorMuted }
-        } else {
+        }
+        else {
             $log += @{ Text = " - nao consegui liberar (precisa administrador). Codigo: $status"; Color = $colorMuted }
         }
-    } catch {
+    }
+    catch {
         $log += @{ Text = " - falha ao limpar cache do sistema: $($_.Exception.Message)"; Color = $colorMuted }
         $log += @{ Text = " - seguindo pro trim de working set mesmo assim."; Color = $colorMuted }
     }
@@ -1893,7 +2087,8 @@ function Stop-BackgroundHelpers {
         if ($proc) {
             $proc | Stop-Process -Force -ErrorAction SilentlyContinue
             return @{ Text = " - $ExeName finalizado"; Color = $colorOk }
-        } else {
+        }
+        else {
             return @{ Text = " - $ExeName nao estava rodando"; Color = $colorMuted }
         }
     }
@@ -1904,11 +2099,11 @@ function Stop-BackgroundHelpers {
 
     $achouDiscord = $false
     Get-CimInstance Win32_Process -Filter "Name='Update.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.ExecutablePath -like '*Discord*' } |
-        ForEach-Object {
-            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-            $achouDiscord = $true
-        }
+    Where-Object { $_.ExecutablePath -like '*Discord*' } |
+    ForEach-Object {
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        $achouDiscord = $true
+    }
     if ($achouDiscord) { $log += @{ Text = " - Discord Update.exe finalizado"; Color = $colorOk } }
 
     $log += Stop-HelperByName "plugin-container.exe"
@@ -1947,12 +2142,12 @@ function Close-HeavyApps {
 }
 
 $RamTools = @(
-    @{ Label = "Ver top 15 processos que mais consomem RAM";                    Action = { Get-TopRamProcesses } }
+    @{ Label = "Ver top 15 processos que mais consomem RAM"; Action = { Get-TopRamProcesses } }
     @{ Label = "Limpar cache do sistema e compactar processos (working set trim)"; Action = { Invoke-WorkingSetTrim } }
-    @{ Label = "Matar processos de fundo do Discord/Spotify (nao fecha o app)";  Action = { Stop-BackgroundHelpers } }
-    @{ Label = "Limpar temporarios, cache DNS, prefetch, thumbnails";            Action = { Clear-SystemCache } }
-    @{ Label = "Reiniciar o Explorer.exe (libera RAM do shell)";                 Action = { Restart-Explorer } }
-    @{ Label = "Fechar Firefox, Discord e Spotify de vez";                       Action = { Close-HeavyApps } }
+    @{ Label = "Matar processos de fundo do Discord/Spotify (nao fecha o app)"; Action = { Stop-BackgroundHelpers } }
+    @{ Label = "Limpar temporarios, cache DNS, prefetch, thumbnails"; Action = { Clear-SystemCache } }
+    @{ Label = "Reiniciar o Explorer.exe (libera RAM do shell)"; Action = { Restart-Explorer } }
+    @{ Label = "Fechar Firefox, Discord e Spotify de vez"; Action = { Close-HeavyApps } }
 )
 
 $ramInfo = {
@@ -2006,7 +2201,7 @@ function Add-CustomGameTab {
 
     $procName = [IO.Path]::GetFileNameWithoutExtension($ExeName)
     $quickActions = @(
-        @{ Text = "BOOST AGORA";  OnClick = (New-BoostAction $procName $backupSub) }
+        @{ Text = "BOOST AGORA"; OnClick = (New-BoostAction $procName $backupSub) }
         @{ Text = "REMOVER JOGO"; OnClick = $removerAction }
     )
 
@@ -2023,14 +2218,14 @@ function Add-CustomGameTab {
 
     $mono = ($Nome.Trim() + "??").Substring(0, 2).ToUpper()
     $GameEntries.Add(@{
-        Slug = $Slug; Nome = $Nome.ToUpper(); ExePath = $ExePath; Mono = $mono
-        Found = (Test-Path $ExePath); LocateKind = "file"
-        OnLocate = {
-            param($p)
-            foreach ($g in $Cfg.CustomGames) { if ($g.Slug -eq $Slug) { $g.ExePath = $p } }
-            Save-Config $Cfg
-        }.GetNewClosure()
-    })
+            Slug = $Slug; Nome = $Nome.ToUpper(); ExePath = $ExePath; Mono = $mono
+            Found = (Test-Path $ExePath); LocateKind = "file"
+            OnLocate = {
+                param($p)
+                foreach ($g in $Cfg.CustomGames) { if ($g.Slug -eq $Slug) { $g.ExePath = $p } }
+                Save-Config $Cfg
+            }.GetNewClosure()
+        })
 
     if ($SaveToConfig) {
         $Cfg.CustomGames = @($Cfg.CustomGames) + [PSCustomObject]@{
@@ -2066,7 +2261,8 @@ function Get-FragBoostBitmap([int]$Size) {
         $g.DrawImage($src, 0, 0, $Size, $Size)
         $g.Dispose(); $src.Dispose(); $ms.Dispose()
         return $dst
-    } catch { return $null }
+    }
+    catch { return $null }
 }
 
 try {
@@ -2074,7 +2270,8 @@ try {
     if (-not (Test-Path $IconFile) -or (Get-Item $IconFile).Length -ne $iconBytes.Length) {
         [IO.File]::WriteAllBytes($IconFile, $iconBytes)
     }
-} catch {}
+}
+catch {}
 
 # ----------------------- JANELA PRINCIPAL -----------------------
 
@@ -2186,16 +2383,16 @@ function New-CategoryButton([string]$text, [System.Windows.Forms.FlowLayoutPanel
     # selecionado (BackColor == colorSideSel, trocado pelo Show-Tab); sem
     # selecao, o desenho nativo do Flat ja basta.
     $b.Add_Paint({
-        param($s, $e)
-        if ($s.BackColor -ne $colorSideSel) { return }
-        Clear-ButtonSurface $s $e.Graphics
-        $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-        $path = New-RoundedPath $s.Width $s.Height $btnRadius
-        $brush = New-Object System.Drawing.SolidBrush($colorSideSel)
-        $e.Graphics.FillPath($brush, $path)
-        Write-ButtonLabel $s $e.Graphics $s.ForeColor
-        $brush.Dispose(); $path.Dispose()
-    }.GetNewClosure())
+            param($s, $e)
+            if ($s.BackColor -ne $colorSideSel) { return }
+            Clear-ButtonSurface $s $e.Graphics
+            $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $path = New-RoundedPath $s.Width $s.Height $btnRadius
+            $brush = New-Object System.Drawing.SolidBrush($colorSideSel)
+            $e.Graphics.FillPath($brush, $path)
+            Write-ButtonLabel $s $e.Graphics $s.ForeColor
+            $brush.Dispose(); $path.Dispose()
+        }.GetNewClosure())
     $parent.Controls.Add($b)
     return $b
 }
@@ -2212,7 +2409,8 @@ function Get-ExeIcon([string]$exePath) {
             $ico.Dispose()
             return $bmp
         }
-    } catch {}
+    }
+    catch {}
     return $null
 }
 
@@ -2231,13 +2429,13 @@ function New-GameTile([hashtable]$Entry, [System.Windows.Forms.FlowLayoutPanel]$
     $tile.Margin = New-Object System.Windows.Forms.Padding(7)
     $tile.BackColor = $colorBg
     $tile.Add_Paint({
-        param($s, $e)
-        $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-        $path = New-RoundedPath $s.Width $s.Height $cardRadius
-        $brush = New-Object System.Drawing.SolidBrush($colorCard)
-        $e.Graphics.FillPath($brush, $path)
-        $brush.Dispose(); $path.Dispose()
-    })
+            param($s, $e)
+            $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $path = New-RoundedPath $s.Width $s.Height $cardRadius
+            $brush = New-Object System.Drawing.SolidBrush($colorCard)
+            $e.Graphics.FillPath($brush, $path)
+            $brush.Dispose(); $path.Dispose()
+        })
 
     $icone = if ($achado) { Get-ExeIcon $Entry.ExePath } else { $null }
 
@@ -2252,34 +2450,35 @@ function New-GameTile([hashtable]$Entry, [System.Windows.Forms.FlowLayoutPanel]$
         Text = if ($achado) { $colorText } else { [System.Drawing.Color]::FromArgb(255, 78, 78, 86) }
     }
     $iconBox.Add_Paint({
-        param($s, $e)
-        $d = $s.Tag
-        $g = $e.Graphics
-        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-        $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-        $path = New-RoundedPath $s.Width $s.Height 8
-        $brush = New-Object System.Drawing.SolidBrush($d.Fill)
-        $g.FillPath($brush, $path)
-        $brush.Dispose(); $path.Dispose()
-        if ($d.Icon) {
-            $sz = 30
-            $ix = [int](($s.Width - $sz) / 2)
-            $iy = [int](($s.Height - $sz) / 2)
-            $ipath = New-Object System.Drawing.Drawing2D.GraphicsPath
-            $ipath.AddPath((New-RoundedPath $sz $sz 6), $false)
-            $m = New-Object System.Drawing.Drawing2D.Matrix
-            $m.Translate($ix, $iy)
-            $ipath.Transform($m)
-            $g.SetClip($ipath)
-            $g.DrawImage($d.Icon, $ix, $iy, $sz, $sz)
-            $g.ResetClip()
-            $m.Dispose(); $ipath.Dispose()
-        } else {
-            $F = [System.Windows.Forms.TextFormatFlags]
-            $rect = New-Object System.Drawing.Rectangle(0, 0, $s.Width, $s.Height)
-            [System.Windows.Forms.TextRenderer]::DrawText($g, $d.Mono, $fontTileMono, $rect, $d.Text, ($F::HorizontalCenter -bor $F::VerticalCenter -bor $F::NoPrefix))
-        }
-    })
+            param($s, $e)
+            $d = $s.Tag
+            $g = $e.Graphics
+            $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $path = New-RoundedPath $s.Width $s.Height 8
+            $brush = New-Object System.Drawing.SolidBrush($d.Fill)
+            $g.FillPath($brush, $path)
+            $brush.Dispose(); $path.Dispose()
+            if ($d.Icon) {
+                $sz = 30
+                $ix = [int](($s.Width - $sz) / 2)
+                $iy = [int](($s.Height - $sz) / 2)
+                $ipath = New-Object System.Drawing.Drawing2D.GraphicsPath
+                $ipath.AddPath((New-RoundedPath $sz $sz 6), $false)
+                $m = New-Object System.Drawing.Drawing2D.Matrix
+                $m.Translate($ix, $iy)
+                $ipath.Transform($m)
+                $g.SetClip($ipath)
+                $g.DrawImage($d.Icon, $ix, $iy, $sz, $sz)
+                $g.ResetClip()
+                $m.Dispose(); $ipath.Dispose()
+            }
+            else {
+                $F = [System.Windows.Forms.TextFormatFlags]
+                $rect = New-Object System.Drawing.Rectangle(0, 0, $s.Width, $s.Height)
+                [System.Windows.Forms.TextRenderer]::DrawText($g, $d.Mono, $fontTileMono, $rect, $d.Text, ($F::HorizontalCenter -bor $F::VerticalCenter -bor $F::NoPrefix))
+            }
+        })
     $tile.Controls.Add($iconBox)
 
     $lblNome = New-Object System.Windows.Forms.Label
@@ -2307,7 +2506,8 @@ function New-GameTile([hashtable]$Entry, [System.Windows.Forms.FlowLayoutPanel]$
         $tile.Cursor = [System.Windows.Forms.Cursors]::Hand
         $clickAlvo = { Show-Tab $Entry.Slug }.GetNewClosure()
         foreach ($ctrl in @($tile, $iconBox, $lblNome, $lblStatus)) { $ctrl.Add_Click($clickAlvo) }
-    } else {
+    }
+    else {
         $lnkLocalizar = New-Object System.Windows.Forms.LinkLabel
         $lnkLocalizar.Text = "localizar manualmente"
         $lnkLocalizar.Font = New-Object System.Drawing.Font($fontFamilyName, 7.5)
@@ -2318,23 +2518,24 @@ function New-GameTile([hashtable]$Entry, [System.Windows.Forms.FlowLayoutPanel]$
         $lnkLocalizar.Location = New-Object System.Drawing.Point(4, 96)
         $lnkLocalizar.Size = New-Object System.Drawing.Size(104, 22)
         $lnkLocalizar.Add_Click({
-            if ($Entry.LocateKind -eq "file") {
-                $ofd = New-Object System.Windows.Forms.OpenFileDialog
-                $ofd.Filter = "Executavel (*.exe)|*.exe"
-                $ofd.Title = "Localizar $($Entry.Nome)"
-                if ($ofd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-                    & $Entry.OnLocate $ofd.FileName
-                    [System.Windows.Forms.MessageBox]::Show("Localizado e salvo. Reinicie o FragBoost pra aplicar.", "Localizar jogo") | Out-Null
+                if ($Entry.LocateKind -eq "file") {
+                    $ofd = New-Object System.Windows.Forms.OpenFileDialog
+                    $ofd.Filter = "Executavel (*.exe)|*.exe"
+                    $ofd.Title = "Localizar $($Entry.Nome)"
+                    if ($ofd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+                        & $Entry.OnLocate $ofd.FileName
+                        [System.Windows.Forms.MessageBox]::Show("Localizado e salvo. Reinicie o FragBoost pra aplicar.", "Localizar jogo") | Out-Null
+                    }
                 }
-            } else {
-                $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
-                $fbd.Description = "Selecione a pasta de instalacao de $($Entry.Nome)"
-                if ($fbd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-                    & $Entry.OnLocate $fbd.SelectedPath
-                    [System.Windows.Forms.MessageBox]::Show("Localizado e salvo. Reinicie o FragBoost pra aplicar.", "Localizar jogo") | Out-Null
+                else {
+                    $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
+                    $fbd.Description = "Selecione a pasta de instalacao de $($Entry.Nome)"
+                    if ($fbd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+                        & $Entry.OnLocate $fbd.SelectedPath
+                        [System.Windows.Forms.MessageBox]::Show("Localizado e salvo. Reinicie o FragBoost pra aplicar.", "Localizar jogo") | Out-Null
+                    }
                 }
-            }
-        }.GetNewClosure())
+            }.GetNewClosure())
         $tile.Controls.Add($lnkLocalizar)
     }
 
@@ -2371,14 +2572,14 @@ function New-GameGridPanel {
     $tileAdd.BackColor = $colorBg
     $tileAdd.Cursor = [System.Windows.Forms.Cursors]::Hand
     $tileAdd.Add_Paint({
-        param($s, $e)
-        $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-        $path = New-RoundedPath $s.Width $s.Height $cardRadius
-        $pen = New-Object System.Drawing.Pen($colorBorder, 1)
-        $pen.DashStyle = [System.Drawing.Drawing2D.DashStyle]::Dash
-        $e.Graphics.DrawPath($pen, $path)
-        $pen.Dispose(); $path.Dispose()
-    })
+            param($s, $e)
+            $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $path = New-RoundedPath $s.Width $s.Height $cardRadius
+            $pen = New-Object System.Drawing.Pen($colorBorder, 1)
+            $pen.DashStyle = [System.Drawing.Drawing2D.DashStyle]::Dash
+            $e.Graphics.DrawPath($pen, $path)
+            $pen.Dispose(); $path.Dispose()
+        })
     $lblPlus = New-Object System.Windows.Forms.Label
     $lblPlus.Text = "+"
     $lblPlus.Font = New-Object System.Drawing.Font($fontFamilyName, 20, [System.Drawing.FontStyle]::Bold)
@@ -2444,24 +2645,25 @@ function New-SistemaPanel {
 
     $btnAtalhoGlobal = New-ActionButton $(if (Test-AtalhoInstalado) { "REMOVER ATALHO" } else { "CRIAR ATALHO" }) 34 270 $colorCard
     $btnAtalhoGlobal.Add_Click({
-        if (Test-AtalhoInstalado) {
-            $r = [System.Windows.Forms.MessageBox]::Show("Atalho sem UAC ja instalado. Remover?", "Atalho", "YesNo")
-            if ($r -eq "Yes") {
-                Remove-Atalho
-                $btnAtalhoGlobal.Text = "CRIAR ATALHO"
-                [System.Windows.Forms.MessageBox]::Show("Atalho removido.", "Atalho") | Out-Null
+            if (Test-AtalhoInstalado) {
+                $r = [System.Windows.Forms.MessageBox]::Show("Atalho sem UAC ja instalado. Remover?", "Atalho", "YesNo")
+                if ($r -eq "Yes") {
+                    Remove-Atalho
+                    $btnAtalhoGlobal.Text = "CRIAR ATALHO"
+                    [System.Windows.Forms.MessageBox]::Show("Atalho removido.", "Atalho") | Out-Null
+                }
             }
-        } else {
-            $r = [System.Windows.Forms.MessageBox]::Show(
-                "Cria um atalho na area de trabalho que abre o FragBoost inteiro direto como admin, sem pedir UAC de novo. Criar agora?",
-                "Atalho", "YesNo")
-            if ($r -eq "Yes") {
-                New-Atalho
-                $btnAtalhoGlobal.Text = "REMOVER ATALHO"
-                [System.Windows.Forms.MessageBox]::Show("Atalho criado na area de trabalho.", "Atalho") | Out-Null
+            else {
+                $r = [System.Windows.Forms.MessageBox]::Show(
+                    "Cria um atalho na area de trabalho que abre o FragBoost inteiro direto como admin, sem pedir UAC de novo. Criar agora?",
+                    "Atalho", "YesNo")
+                if ($r -eq "Yes") {
+                    New-Atalho
+                    $btnAtalhoGlobal.Text = "REMOVER ATALHO"
+                    [System.Windows.Forms.MessageBox]::Show("Atalho criado na area de trabalho.", "Atalho") | Out-Null
+                }
             }
-        }
-    }.GetNewClosure())
+        }.GetNewClosure())
     $card.Controls.Add($btnAtalhoGlobal)
 
     $lblInfo = New-Object System.Windows.Forms.Label
@@ -2480,69 +2682,69 @@ $PanelValorant.Location = New-Object System.Drawing.Point(0, 0)
 $contentHost.Controls.Add($PanelValorant)
 $TabPanels["VALORANT"] = $PanelValorant
 $GameEntries.Add(@{
-    Slug = "VALORANT"; Nome = "VALORANT"; ExePath = $ValExe; Mono = "VA"
-    Found = (Test-Path $ValExe); LocateKind = "folder"
-    OnLocate = { param($p) $Cfg.RiotDir = $p; Save-Config $Cfg }.GetNewClosure()
-})
+        Slug = "VALORANT"; Nome = "VALORANT"; ExePath = $ValExe; Mono = "VA"
+        Found = (Test-Path $ValExe); LocateKind = "folder"
+        OnLocate = { param($p) $Cfg.RiotDir = $p; Save-Config $Cfg }.GetNewClosure()
+    })
 
 $PanelRoblox.Location = New-Object System.Drawing.Point(0, 0)
 $contentHost.Controls.Add($PanelRoblox)
 $TabPanels["ROBLOX"] = $PanelRoblox
 $GameEntries.Add(@{
-    Slug = "ROBLOX"; Nome = "ROBLOX"; ExePath = $RbxExe; Mono = "RB"
-    Found = (Test-Path $RbxExe); LocateKind = "folder"
-    OnLocate = { param($p) $Cfg.RobloxDir = $p; Save-Config $Cfg }.GetNewClosure()
-})
+        Slug = "ROBLOX"; Nome = "ROBLOX"; ExePath = $RbxExe; Mono = "RB"
+        Found = (Test-Path $RbxExe); LocateKind = "folder"
+        OnLocate = { param($p) $Cfg.RobloxDir = $p; Save-Config $Cfg }.GetNewClosure()
+    })
 
 $PanelMinecraft.Location = New-Object System.Drawing.Point(0, 0)
 $contentHost.Controls.Add($PanelMinecraft)
 $TabPanels["MINECRAFT"] = $PanelMinecraft
 $GameEntries.Add(@{
-    Slug = "MINECRAFT"; Nome = "MINECRAFT"; ExePath = $McJavaw; Mono = "MC"
-    Found = (Test-Path $McJavaw); LocateKind = "file"
-    OnLocate = { param($p) $Cfg.MinecraftJavaw = $p; Save-Config $Cfg }.GetNewClosure()
-})
+        Slug = "MINECRAFT"; Nome = "MINECRAFT"; ExePath = $McJavaw; Mono = "MC"
+        Found = (Test-Path $McJavaw); LocateKind = "file"
+        OnLocate = { param($p) $Cfg.MinecraftJavaw = $p; Save-Config $Cfg }.GetNewClosure()
+    })
 
 $PanelCs2.Location = New-Object System.Drawing.Point(0, 0)
 $contentHost.Controls.Add($PanelCs2)
 $TabPanels["CS2"] = $PanelCs2
 $GameEntries.Add(@{
-    Slug = "CS2"; Nome = "CS2"; ExePath = $Cs2Exe; Mono = "CS"
-    Found = (Test-Path $Cs2Exe); LocateKind = "folder"
-    OnLocate = { param($p) $Cfg.Cs2Dir = $p; Save-Config $Cfg }.GetNewClosure()
-})
+        Slug = "CS2"; Nome = "CS2"; ExePath = $Cs2Exe; Mono = "CS"
+        Found = (Test-Path $Cs2Exe); LocateKind = "folder"
+        OnLocate = { param($p) $Cfg.Cs2Dir = $p; Save-Config $Cfg }.GetNewClosure()
+    })
 
 $PanelGta.Location = New-Object System.Drawing.Point(0, 0)
 $contentHost.Controls.Add($PanelGta)
 $TabPanels["GTAV"] = $PanelGta
 $GameEntries.Add(@{
-    Slug = "GTAV"; Nome = "GTA V"; ExePath = $GtaExe; Mono = "GT"
-    Found = (Test-Path $GtaExe); LocateKind = "folder"
-    OnLocate = {
-        param($p)
-        $Cfg.GtaDir = $p
-        $Cfg.GtaExeName = if (Test-Path (Join-Path $p "GTA5_Enhanced.exe")) { "GTA5_Enhanced.exe" } else { "GTA5.exe" }
-        Save-Config $Cfg
-    }.GetNewClosure()
-})
+        Slug = "GTAV"; Nome = "GTA V"; ExePath = $GtaExe; Mono = "GT"
+        Found = (Test-Path $GtaExe); LocateKind = "folder"
+        OnLocate = {
+            param($p)
+            $Cfg.GtaDir = $p
+            $Cfg.GtaExeName = if (Test-Path (Join-Path $p "GTA5_Enhanced.exe")) { "GTA5_Enhanced.exe" } else { "GTA5.exe" }
+            Save-Config $Cfg
+        }.GetNewClosure()
+    })
 
 $PanelWarframe.Location = New-Object System.Drawing.Point(0, 0)
 $contentHost.Controls.Add($PanelWarframe)
 $TabPanels["WARFRAME"] = $PanelWarframe
 $GameEntries.Add(@{
-    Slug = "WARFRAME"; Nome = "WARFRAME"; ExePath = $WfExe; Mono = "WF"
-    Found = (Test-Path $WfExe); LocateKind = "folder"
-    OnLocate = { param($p) $Cfg.WarframeDir = $p; Save-Config $Cfg }.GetNewClosure()
-})
+        Slug = "WARFRAME"; Nome = "WARFRAME"; ExePath = $WfExe; Mono = "WF"
+        Found = (Test-Path $WfExe); LocateKind = "folder"
+        OnLocate = { param($p) $Cfg.WarframeDir = $p; Save-Config $Cfg }.GetNewClosure()
+    })
 
 $PanelDayz.Location = New-Object System.Drawing.Point(0, 0)
 $contentHost.Controls.Add($PanelDayz)
 $TabPanels["DAYZ"] = $PanelDayz
 $GameEntries.Add(@{
-    Slug = "DAYZ"; Nome = "DAYZ"; ExePath = $DayzExe; Mono = "DZ"
-    Found = (Test-Path $DayzExe); LocateKind = "folder"
-    OnLocate = { param($p) $Cfg.DayzDir = $p; Save-Config $Cfg }.GetNewClosure()
-})
+        Slug = "DAYZ"; Nome = "DAYZ"; ExePath = $DayzExe; Mono = "DZ"
+        Found = (Test-Path $DayzExe); LocateKind = "folder"
+        OnLocate = { param($p) $Cfg.DayzDir = $p; Save-Config $Cfg }.GetNewClosure()
+    })
 
 $PanelCpu.Location = New-Object System.Drawing.Point(0, 0)
 $contentHost.Controls.Add($PanelCpu)
@@ -2628,15 +2830,15 @@ $btnEscolherExe.ForeColor = $colorText
 $btnEscolherExe.Location = New-Object System.Drawing.Point(15, 96)
 $btnEscolherExe.Size = New-Object System.Drawing.Size(260, 36)
 $btnEscolherExe.Add_Paint({
-    param($s, $e)
-    Clear-ButtonSurface $s $e.Graphics
-    $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    $path = New-RoundedPath $s.Width $s.Height $btnRadius
-    $pen = New-Object System.Drawing.Pen($colorAccent, 1)
-    $e.Graphics.DrawPath($pen, $path)
-    Write-ButtonLabel $s $e.Graphics $s.ForeColor
-    $pen.Dispose(); $path.Dispose()
-})
+        param($s, $e)
+        Clear-ButtonSurface $s $e.Graphics
+        $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $path = New-RoundedPath $s.Width $s.Height $btnRadius
+        $pen = New-Object System.Drawing.Pen($colorAccent, 1)
+        $e.Graphics.DrawPath($pen, $path)
+        Write-ButtonLabel $s $e.Graphics $s.ForeColor
+        $pen.Dispose(); $path.Dispose()
+    })
 $gbAdd.Controls.Add($btnEscolherExe)
 
 $lblExeEscolhido = New-Object System.Windows.Forms.Label
@@ -2657,59 +2859,59 @@ $btnAdicionarJogo.ForeColor = [System.Drawing.Color]::White
 $btnAdicionarJogo.Location = New-Object System.Drawing.Point(15, 164)
 $btnAdicionarJogo.Size = New-Object System.Drawing.Size(260, 30)
 $btnAdicionarJogo.Add_Paint({
-    param($s, $e)
-    Clear-ButtonSurface $s $e.Graphics
-    $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    $path = New-RoundedPath $s.Width $s.Height $btnRadius
-    $brush = New-Object System.Drawing.SolidBrush($colorAccent)
-    $e.Graphics.FillPath($brush, $path)
-    Write-ButtonLabel $s $e.Graphics $s.ForeColor
-    $brush.Dispose(); $path.Dispose()
-})
+        param($s, $e)
+        Clear-ButtonSurface $s $e.Graphics
+        $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $path = New-RoundedPath $s.Width $s.Height $btnRadius
+        $brush = New-Object System.Drawing.SolidBrush($colorAccent)
+        $e.Graphics.FillPath($brush, $path)
+        Write-ButtonLabel $s $e.Graphics $s.ForeColor
+        $brush.Dispose(); $path.Dispose()
+    })
 $gbAdd.Controls.Add($btnAdicionarJogo)
 
 $script:GeralExePath = $null
 
 $btnEscolherExe.Add_Click({
-    $ofd = New-Object System.Windows.Forms.OpenFileDialog
-    $ofd.Filter = "Executavel (*.exe)|*.exe"
-    $ofd.Title = "Selecionar executavel do jogo"
-    if ($ofd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-        $script:GeralExePath = $ofd.FileName
-        $lblExeEscolhido.Text = $ofd.FileName
-        $lblExeEscolhido.ForeColor = $colorText
-    }
-})
+        $ofd = New-Object System.Windows.Forms.OpenFileDialog
+        $ofd.Filter = "Executavel (*.exe)|*.exe"
+        $ofd.Title = "Selecionar executavel do jogo"
+        if ($ofd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $script:GeralExePath = $ofd.FileName
+            $lblExeEscolhido.Text = $ofd.FileName
+            $lblExeEscolhido.ForeColor = $colorText
+        }
+    })
 
 $btnAdicionarJogo.Add_Click({
-    $nome = $txtNomeJogo.Text.Trim()
-    if (-not $nome) {
-        [System.Windows.Forms.MessageBox]::Show("Digite um nome pro jogo.", "FragBoost") | Out-Null
-        return
-    }
-    if (-not $script:GeralExePath -or -not (Test-Path $script:GeralExePath)) {
-        [System.Windows.Forms.MessageBox]::Show("Selecione um executavel (.exe) valido.", "FragBoost") | Out-Null
-        return
-    }
+        $nome = $txtNomeJogo.Text.Trim()
+        if (-not $nome) {
+            [System.Windows.Forms.MessageBox]::Show("Digite um nome pro jogo.", "FragBoost") | Out-Null
+            return
+        }
+        if (-not $script:GeralExePath -or -not (Test-Path $script:GeralExePath)) {
+            [System.Windows.Forms.MessageBox]::Show("Selecione um executavel (.exe) valido.", "FragBoost") | Out-Null
+            return
+        }
 
-    $baseSlug = Get-GameSlug $nome
-    $slug = $baseSlug
-    $n = 2
-    while ($TabPanels.ContainsKey($slug)) { $slug = "${baseSlug}_$n"; $n++ }
+        $baseSlug = Get-GameSlug $nome
+        $slug = $baseSlug
+        $n = 2
+        while ($TabPanels.ContainsKey($slug)) { $slug = "${baseSlug}_$n"; $n++ }
 
-    $exeName = Split-Path -Leaf $script:GeralExePath
-    $gameDir = Split-Path -Parent $script:GeralExePath
+        $exeName = Split-Path -Leaf $script:GeralExePath
+        $gameDir = Split-Path -Parent $script:GeralExePath
 
-    Add-CustomGameTab -Nome $nome -ExeName $exeName -ExePath $script:GeralExePath -GameDir $gameDir -Slug $slug -SaveToConfig $true
-    Rebuild-GameGrid
+        Add-CustomGameTab -Nome $nome -ExeName $exeName -ExePath $script:GeralExePath -GameDir $gameDir -Slug $slug -SaveToConfig $true
+        Rebuild-GameGrid
 
-    $txtNomeJogo.Text = ""
-    $lblExeEscolhido.Text = "(nenhum executavel selecionado)"
-    $lblExeEscolhido.ForeColor = $colorMuted
-    $script:GeralExePath = $null
+        $txtNomeJogo.Text = ""
+        $lblExeEscolhido.Text = "(nenhum executavel selecionado)"
+        $lblExeEscolhido.ForeColor = $colorMuted
+        $script:GeralExePath = $null
 
-    Show-Tab $slug
-})
+        Show-Tab $slug
+    })
 
 $contentHost.Controls.Add($panelGeral)
 $TabPanels["GERAL"] = $panelGeral
