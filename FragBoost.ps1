@@ -175,19 +175,47 @@ function Get-GuidAtivo {
     return Get-Guid $raw
 }
 
+# plano dedicado do FragBoost. Ajuste de energia (throttle, core parking) so
+# mexe nele, nunca no plano do usuario nem no built-in. Cria copia do plano
+# ativo na primeira vez; o Restore-Owner apaga quando a ultima aba reverte.
+function Get-FragBoostPlan {
+    $lista = powercfg /list | Out-String
+    if ($lista -match "([0-9a-fA-F-]{36})\s+\(FragBoost\)") { return $Matches[1] }
+    $ativo = Get-GuidAtivo
+    if (-not $ativo) { return $null }
+    $novo = Get-Guid (powercfg /duplicatescheme $ativo | Out-String)
+    if ($novo) { powercfg /changename $novo "FragBoost" | Out-Null }
+    return $novo
+}
+
+# plano Ultimate: reaproveita o que ja existe, senao duplica UMA vez. Sem isso
+# cada Apply criava uma copia nova e o Restore nunca apagava. O nome fixo
+# ajuda a achar de novo mesmo em Windows que nao ta em ingles.
+function Get-UltimatePlan {
+    $lista = powercfg /list | Out-String
+    if ($lista -match "([0-9a-fA-F-]{36})\s*\(Ultimate Performance\)") { return $Matches[1] }
+    $novo = Get-Guid (powercfg /duplicatescheme $ULTIMATE_GUID | Out-String)
+    if ($novo) { powercfg /changename $novo "Ultimate Performance" | Out-Null }
+    return $novo
+}
+
 function Save-PowerPlanOriginal([string]$owner) {
+    # devolve $false se nao deu pra guardar. Quem chama tem que abortar,
+    # senao o Apply troca o plano sem original guardado.
     $state = Load-State
+    if ($null -eq $state) { $global:FragFalha = $true; return $false }
     # grava o plano original UMA vez. Se o jogo B chegar depois do A, o plano
     # ativo ja e o Ultimate do A, entao nao pode sobrescrever.
     if (-not $state.PowerPlan) {
         $guid = Get-GuidAtivo
-        if (-not $guid) { return }
+        if (-not $guid) { $global:FragFalha = $true; return $false }
         $state.PowerPlan = [PSCustomObject]@{ Guid = $guid; Owners = @() }
     }
     if (@($state.PowerPlan.Owners) -notcontains $owner) {
         $state.PowerPlan.Owners = @($state.PowerPlan.Owners) + $owner
     }
-    Save-State $state | Out-Null
+    if (-not (Save-State $state)) { $global:FragFalha = $true; return $false }
+    return $true
 }
 
 function Get-SavedPowerPlan([string]$subDir) {
@@ -205,18 +233,32 @@ function Get-SavedPowerPlan([string]$subDir) {
 $StateFile = Join-Path $BackupRoot "global_backup\state.json"
 $global:FragOwner = $null    # aba que ta aplicando agora (Set-Reg le isso)
 $global:FragFalha = $false   # true se nao deu pra guardar algum original
+$global:FragMantidos = @{ Qtd = 0; Por = @() }   # o que o ultimo Restore-Owner NAO restaurou (outra aba ainda segura)
+$global:FragEstadoRuim = $false   # true se o ultimo Load-State nao conseguiu ler o state.json
+$global:FragCopiaFeita = $false   # copia do state.json corrompido: 1x por sessao, senao junta lixo
+$global:FragResetKind = $null     # o que o Reset-* fez: estado / nada / erro / legado
 
 function Load-State {
-    $s = [PSCustomObject]@{ Regs = @(); PowerPlan = $null }
+    $global:FragEstadoRuim = $false
+    $s = [PSCustomObject]@{ Regs = @(); PowerPlan = $null; Defs = @() }
     if (Test-Path $StateFile) {
         try {
-            $raw = Get-Content $StateFile -Raw -ErrorAction Stop | ConvertFrom-Json
+            $raw = Get-Content $StateFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
             if ($raw.Regs) { $s.Regs = @($raw.Regs) }
             if ($raw.PowerPlan) { $s.PowerPlan = $raw.PowerPlan }
+            if ($raw.Defs) { $s.Defs = @($raw.Defs) }
         }
         catch {
-            # json quebrado: guarda copia, senao o proximo Save apaga os originais
-            Copy-Item $StateFile "$StateFile.corrompido" -Force
+            # json quebrado: guarda copia com data (nao sobrescreve a anterior) e
+            # devolve $null. Quem recebe $null aborta. Estado vazio faria o proximo
+            # Apply gravar valor ja mexido como "original".
+            $global:FragEstadoRuim = $true
+            # cada Set-Reg carrega o estado de novo. Sem a flag, uma copia por chamada.
+            if (-not $global:FragCopiaFeita) {
+                Copy-Item $StateFile ("$StateFile.corrompido_{0:yyyyMMdd_HHmmss}" -f (Get-Date)) -Force
+                $global:FragCopiaFeita = $true
+            }
+            return $null
         }
     }
     return $s
@@ -235,8 +277,82 @@ function Save-State($s) {
     catch { return $false }
 }
 
+# aba com .novo ja passou pelo estado novo. So aba sem marca (legada)
+# pode cair no reg import / padrao chutado.
+function Set-TabNova([string]$sub) {
+    $d = Join-Path $BackupRoot $sub
+    if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+    New-Item -ItemType File -Path (Join-Path $d ".novo") -Force | Out-Null
+}
+function Test-TabNova([string]$sub) {
+    Test-Path (Join-Path (Join-Path $BackupRoot $sub) ".novo")
+}
+
+# aba que ja e dona de alguma coisa no state.json. Nao precisa do .novo pra
+# saber que passou pelo estado novo (caso de aba aplicada antes do marcador).
+function Test-TabNoEstado([string]$sub) {
+    $s = Load-State
+    if ($null -eq $s) { return $false }
+    foreach ($r in @($s.Regs)) { if (@($r.Owners) -contains $sub) { return $true } }
+    foreach ($d in @($s.Defs)) { if (@($d.Owners) -contains $sub) { return $true } }
+    if ($s.PowerPlan -and (@($s.PowerPlan.Owners) -contains $sub)) { return $true }
+    return $false
+}
+
+# aba que so passou pela versao antiga: nao tem estado, so .reg + plano salvo.
+# Marca .novo no fim, senao o proximo Reverter reimporta o mesmo .reg e
+# sobrescreve valor que outra aba ja mexeu.
+function Restore-Legado([string]$sub) {
+    $d = Join-Path $BackupRoot $sub
+    Get-ChildItem -Path $d -Filter "*.reg" | ForEach-Object { reg.exe import "$($_.FullName)" *> $null }
+    $guidSalvo = Get-SavedPowerPlan $sub
+    if ($guidSalvo) { powercfg /setactive $guidSalvo }
+    Set-TabNova $sub
+}
+
+# Primeiro Apply/Boost numa aba com backup legado: depois disso ela vira .novo
+# e o Reverter nunca mais chega no reg import. Oferece reverter o legado antes.
+# Devolve $false se o usuario cancelou.
+function Confirm-LegadoAntesDeAplicar([string]$sub) {
+    if (Test-TabNova $sub) { return $true }
+    $regs = @(Get-ChildItem -Path (Join-Path $BackupRoot $sub) -Filter "*.reg" -ErrorAction SilentlyContinue)
+    if ($regs.Count -eq 0) { return $true }
+    if (Test-TabNoEstado $sub) { Set-TabNova $sub; return $true }
+    $r = [System.Windows.Forms.MessageBox]::Show(
+        "Essa aba tem backup da versao antiga do FragBoost (.reg) e nada no estado novo.`nSim = reverter o legado agora e aplicar em seguida (recomendado).`nNao = aplicar sem reverter. O legado nao volta mais depois.`nCancelar = nao fazer nada.",
+        "Backup legado", "YesNoCancel")
+    if ($r -eq "Cancel") { return $false }
+    if ($r -eq "Yes") { Restore-Legado $sub }
+    return $true
+}
+
+# Defender no state.json, igual ao registro: guarda se a exclusao ja existia
+# antes do FragBoost e quem depende dela. Sem isso o Reverter ou nao remove
+# nada, ou remove exclusao que o usuario ja tinha.
+function Save-DefenderOriginal([string]$path, [string]$owner) {
+    $state = Load-State
+    if ($null -eq $state) { return $false }
+    $rec = @($state.Defs) | Where-Object { $_.Path -ieq $path } | Select-Object -First 1
+    if (-not $rec) {
+        $existia = [bool]((Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath -contains $path)
+        $rec = [PSCustomObject]@{ Path = $path; Existed = $existia; Owners = @() }
+        $state.Defs = @($state.Defs) + $rec
+    }
+    if (@($rec.Owners) -notcontains $owner) { $rec.Owners = @($rec.Owners) + $owner }
+    return (Save-State $state)
+}
+
+# So apaga a chave se nao sobrou valor nem subchave (PerfOptions do IFEO).
+function Remove-ChaveVazia([string]$path) {
+    $k = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
+    if ($k -and $k.ValueCount -eq 0 -and $k.SubKeyCount -eq 0) {
+        Remove-Item -LiteralPath $path -ErrorAction SilentlyContinue
+    }
+}
+
 function Save-RegOriginal([string]$path, [string]$name, [string]$owner) {
     $state = Load-State
+    if ($null -eq $state) { return $false }
     $id = "$path|$name"
     $rec = @($state.Regs) | Where-Object { $_.Id -eq $id } | Select-Object -First 1
 
@@ -258,27 +374,65 @@ function Save-RegOriginal([string]$path, [string]$name, [string]$owner) {
 
 function Restore-Owner([string]$owner) {
     $global:FragOwner = $null   # restaurar nao pode rastrear de novo
+    $global:FragMantidos = @{ Qtd = 0; Por = @() }
     $state = Load-State
+    if ($null -eq $state) { return $false }
     $mexeu = $false
+    # o que outra aba ainda segura: nao volta pro original, e a mensagem precisa dizer
+    $mantidos = 0
+    $mantidosPor = @()
 
     foreach ($rec in @($state.Regs)) {
         if (@($rec.Owners) -notcontains $owner) { continue }
         $mexeu = $true
         $rec.Owners = @($rec.Owners | Where-Object { $_ -ne $owner })
         # outra aba ainda depende desse valor: deixa como ta
-        if (@($rec.Owners).Count -gt 0) { continue }
+        if (@($rec.Owners).Count -gt 0) {
+            $mantidos++
+            $mantidosPor += @($rec.Owners)
+            continue
+        }
 
         if ($rec.Existed) {
             $data = $rec.Data
             if ($rec.Kind -eq "Binary") { $data = [byte[]]$data }
             if ($rec.Kind -eq "MultiString") { $data = [string[]]$data }
             Set-Reg $rec.Path $rec.Name $data $rec.Kind
+            # servico: escrever no registro nao avisa o SCM. Sem isso continua
+            # Disabled e parado ate reiniciar.
+            if ($rec.Path -like "*\Services\*" -and $rec.Name -eq "Start") {
+                $svc  = Split-Path $rec.Path -Leaf
+                $modo = @{ 2 = "Automatic"; 3 = "Manual"; 4 = "Disabled" }[[int]$rec.Data]
+                if ($modo) { Set-Service -Name $svc -StartupType $modo -ErrorAction SilentlyContinue }
+                if ($modo -eq "Automatic") { Start-Service -Name $svc -ErrorAction SilentlyContinue }
+            }
         }
         else {
             Remove-Reg $rec.Path $rec.Name
+            # IFEO: o valor saiu, mas a chave PerfOptions (e a do exe) ficava la vazia
+            if ($rec.Path -like "*\Image File Execution Options\*\PerfOptions") {
+                Remove-ChaveVazia $rec.Path
+                Remove-ChaveVazia (Split-Path $rec.Path -Parent)
+            }
         }
     }
     $state.Regs = @($state.Regs | Where-Object { @($_.Owners).Count -gt 0 })
+
+    foreach ($def in @($state.Defs)) {
+        if (@($def.Owners) -notcontains $owner) { continue }
+        $mexeu = $true
+        $def.Owners = @($def.Owners | Where-Object { $_ -ne $owner })
+        if (@($def.Owners).Count -gt 0) {
+            $mantidos++
+            $mantidosPor += @($def.Owners)
+            continue
+        }
+        # so tira se foi o FragBoost que colocou. Exclusao que ja existia antes fica.
+        if (-not $def.Existed) {
+            try { Remove-MpPreference -ExclusionPath $def.Path -ErrorAction Stop } catch {}
+        }
+    }
+    $state.Defs = @($state.Defs | Where-Object { @($_.Owners).Count -gt 0 })
 
     $pp = $state.PowerPlan
     if ($pp -and (@($pp.Owners) -contains $owner)) {
@@ -288,12 +442,28 @@ function Restore-Owner([string]$owner) {
             powercfg /setactive $pp.Guid *> $null
             # plano original pode ter sido apagado pelo usuario
             if ($LASTEXITCODE -ne 0) { powercfg /setactive SCHEME_BALANCED *> $null }
+            # ultima aba dona: o plano dedicado do FragBoost ja saiu do ativo, pode apagar
+            $lista = powercfg /list | Out-String
+            if ($lista -match "([0-9a-fA-F-]{36})\s+\(FragBoost\)") { powercfg /delete $Matches[1] *> $null }
             $state.PowerPlan = $null
+        }
+        else {
+            $mantidos++
+            $mantidosPor += @($pp.Owners)
         }
     }
 
     Save-State $state | Out-Null
+    $global:FragMantidos = @{ Qtd = $mantidos; Por = @($mantidosPor | Sort-Object -Unique) }
     return $mexeu
+}
+
+# texto extra pros MessageBox de reverter. Vazio se nada ficou preso em outra aba.
+function Get-TextoMantidos {
+    $m = $global:FragMantidos
+    if (-not $m -or $m.Qtd -eq 0) { return "" }
+    $rotulo = if ($m.Qtd -eq 1) { "valor continua" } else { "valores continuam" }
+    return "$($m.Qtd) $rotulo em uso por: $(@($m.Por) -join ', ')."
 }
 
 # ----------------------- ATALHO SEM UAC (app inteiro, um so pra tudo) -----------------------
@@ -586,21 +756,10 @@ $G_GAMEDVR_KEY = "HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR"
 $G_BGAPPS_KEY = "HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications"
 $G_GAMEBAR_KEY = "HKCU:\Software\Microsoft\GameBar"
 
-# ----------------------- OTIMIZACAO UNIVERSAL (qualquer jogo) -----------------------
-# Mesmo conjunto de ajustes do Valorant Otimizador original, so que
-# parametrizado: recebe o executavel/pasta de UM jogo e devolve os
-# ajustes prontos pra ele. Roblox e qualquer jogo que o usuario
-# adicionar na biblioteca usam esta mesma funcao - "otimizacoes
-# universais" de verdade, um lugar so pra manter.
-#
-# Cada StatusCheck/Apply usa .GetNewClosure() de proposito: como esta
-# dentro de uma funcao com parametro, sem isso o script perderia a
-# referencia a $ExeName/$ExePath/$GameDir/$BackupSub assim que a
-# funcao retornasse (mesmo motivo do .GetNewClosure() ja usado em
-# New-DragHandler nas versoes antigas).
-
+# So julga se a pasta e ampla demais. Existencia e checada por quem chama,
+# senao pasta que nao existe vira mensagem de "ampla demais".
 function Test-PastaExclusaoSegura([string]$dir) {
-    if (-not $dir -or -not (Test-Path $dir)) { return $false }
+    if (-not $dir) { return $false }
     $full = [IO.Path]::GetFullPath($dir).TrimEnd("\")
     # raiz de disco ("C:") tem 2 chars
     if ($full.Length -le 3) { return $false }
@@ -615,6 +774,18 @@ function Test-PastaExclusaoSegura([string]$dir) {
     return $true
 }
 
+# ----------------------- OTIMIZACAO UNIVERSAL (qualquer jogo) -----------------------
+# Mesmo conjunto de ajustes do Valorant Otimizador original, so que
+# parametrizado: recebe o executavel/pasta de UM jogo e devolve os
+# ajustes prontos pra ele. Roblox e qualquer jogo que o usuario
+# adicionar na biblioteca usam esta mesma funcao - "otimizacoes
+# universais" de verdade, um lugar so pra manter.
+#
+# Cada StatusCheck/Apply usa .GetNewClosure() de proposito: como esta
+# dentro de uma funcao com parametro, sem isso o script perderia a
+# referencia a $ExeName/$ExePath/$GameDir/$BackupSub assim que a
+# funcao retornasse (mesmo motivo do .GetNewClosure() ja usado em
+# New-DragHandler nas versoes antigas).
 function Get-UniversalGameTweaks {
     param(
         [string]$ExeName,
@@ -678,10 +849,16 @@ function Get-UniversalGameTweaks {
         @{ Label        = "Excluir pasta do jogo do Defender"
             StatusCheck = { (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath -contains $GameDir }.GetNewClosure()
             Apply       = {
+                if (-not $GameDir -or -not (Test-Path $GameDir)) {
+                    [System.Windows.Forms.MessageBox]::Show("Pasta do jogo nao encontrada:`n$GameDir`nLocaliza o jogo antes de excluir do Defender.", "FragBoost") | Out-Null
+                    return
+                }
                 if (-not (Test-PastaExclusaoSegura $GameDir)) {
                     [System.Windows.Forms.MessageBox]::Show("Pasta ampla demais pra excluir do Defender:`n$GameDir`nMove o jogo pra uma pasta so dele.", "FragBoost") | Out-Null
                     return
                 }
+                # guarda se a exclusao ja existia. Sem registro, o Reverter nao sabe se pode remover.
+                if (-not (Save-DefenderOriginal $GameDir $global:FragOwner)) { $global:FragFalha = $true; return }
                 try { Add-MpPreference -ExclusionPath $GameDir -ErrorAction Stop } catch {}
             }.GetNewClosure()
         },
@@ -695,9 +872,8 @@ function Get-UniversalGameTweaks {
         @{ Label        = "Ultimate Performance (energia)"
             StatusCheck = { (powercfg /getactivescheme | Out-String) -match "Ultimate Performance" }.GetNewClosure()
             Apply       = {
-                Save-PowerPlanOriginal $BackupSub
-                $dupTxt = powercfg /duplicatescheme $ULTIMATE_GUID | Out-String
-                $novoGuid = Get-Guid $dupTxt
+                if (-not (Save-PowerPlanOriginal $BackupSub)) { return }
+                $novoGuid = Get-UltimatePlan
                 if ($novoGuid) { powercfg /setactive $novoGuid }
             }.GetNewClosure()
         },
@@ -753,10 +929,15 @@ function Reset-UniversalGameDefaults {
 
     if ($IFEO_BLOCKLIST -contains "$ExeName".ToLower()) { $SkipCpuPriority = $true }
 
-    # Defender e por pasta (nao e global), sai sempre
-    try { Remove-MpPreference -ExclusionPath $GameDir -ErrorAction Stop } catch {}
-    # tem original guardado: usa ele e nao chuta padrao
-    if (Restore-Owner $BackupSub) { return }
+    # o que o Reset fez, pro Reverter dizer a verdade na mensagem
+    $global:FragResetKind = "legado"
+    # tem original guardado: usa ele e nao chuta padrao. A exclusao do Defender
+    # tambem sai por aqui, so se foi o FragBoost que colocou.
+    if (Restore-Owner $BackupSub) { $global:FragResetKind = "estado"; return }
+    # state.json ilegivel: nao sabe o que e original, nao chuta padrao
+    if ($global:FragEstadoRuim) { $global:FragResetKind = "erro"; return }
+    # aba ja passou pelo estado novo e nao tem nada ativo: nao chuta padrao global
+    if (Test-TabNova $BackupSub) { $global:FragResetKind = "nada"; return }
     # daqui pra baixo: legado (aba que nunca passou pelo estado novo)
 
     $ifeoKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\$ExeName\PerfOptions"
@@ -1112,27 +1293,40 @@ function New-TweaksPanel {
     $gbRight.Controls.Add($btnApply)
 
     $btnApply.Add_Click({
-            $any = $false
+            $sel = @($Tweaks | Where-Object { $_.Control.Checked })
+            if ($sel.Count -eq 0) {
+                [System.Windows.Forms.MessageBox]::Show("Nenhum ajuste selecionado.", "FragBoost") | Out-Null
+                return
+            }
+            # aba com backup legado: oferece reverter antes, senao o Reverter perde o .reg
+            if (-not (Confirm-LegadoAntesDeAplicar $BackupSubDir)) { return }
+            $ok = @()
+            $falhou = @()
             $global:FragOwner = $BackupSubDir
-            $global:FragFalha = $false
             try {
-                foreach ($t in $Tweaks) {
-                    if ($t.Control.Checked) { & $t.Apply; $any = $true }
+                foreach ($t in $sel) {
+                    # flag por ajuste: sabe quem falhou sem perder quem aplicou
+                    $global:FragFalha = $false
+                    & $t.Apply
+                    if ($global:FragFalha) { $falhou += $t.Label } else { $ok += $t.Label }
                 }
             }
             finally {
                 $global:FragOwner = $null
+                # marca so se algo entrou no estado. Aba onde tudo falhou continua
+                # podendo cair no legado, nao tem motivo pra travar isso.
+                if ($ok.Count -gt 0 -or (Test-TabNoEstado $BackupSubDir)) { Set-TabNova $BackupSubDir }
             }
-            if ($global:FragFalha) {
-                [System.Windows.Forms.MessageBox]::Show("Nao deu pra guardar o valor original de algum ajuste. Esse ajuste NAO foi aplicado. Confere permissao da pasta global_backup.", "FragBoost") | Out-Null
-                return
+            $partes = @()
+            if ($ok.Count -gt 0) {
+                $partes += "Ajustes aplicados. Reinicie o PC pra tudo valer."
             }
-            if ($any) {
-                [System.Windows.Forms.MessageBox]::Show("Ajustes aplicados. Reinicie o PC pra tudo valer.", "FragBoost") | Out-Null
+            if ($falhou.Count -gt 0) {
+                $motivo = "Confere permissao da pasta global_backup."
+                if ($global:FragEstadoRuim) { $motivo = "O state.json esta ilegivel. Copia salva ao lado dele (.corrompido_data). Conserta ou apaga o arquivo e tenta de novo." }
+                $partes += "Nao deu pra guardar o valor original de:`n- " + ($falhou -join "`n- ") + "`nEsses NAO foram aplicados por completo. $motivo"
             }
-            else {
-                [System.Windows.Forms.MessageBox]::Show("Nenhum ajuste selecionado.", "FragBoost") | Out-Null
-            }
+            [System.Windows.Forms.MessageBox]::Show(($partes -join "`n`n"), "FragBoost") | Out-Null
         }.GetNewClosure())
 
     $btnStatus.Add_Click({
@@ -1230,15 +1424,28 @@ function New-TweaksPanel {
 
             if ($r -eq "Yes") {
                 if (Restore-Owner $BackupSubDir) {
+                    $extra = Get-TextoMantidos
                     foreach ($t in $Tweaks) { $t.Control.Checked = [bool](& $t.StatusCheck) }
                     & $refreshInfo
-                    [System.Windows.Forms.MessageBox]::Show("Valores originais restaurados. Reinicie o PC.", "Reverter") | Out-Null
+                    if ($extra) {
+                        [System.Windows.Forms.MessageBox]::Show("Restaurado o que so essa aba segurava.`n$extra`nReinicie o PC.", "Reverter") | Out-Null
+                    }
+                    else {
+                        [System.Windows.Forms.MessageBox]::Show("Valores originais restaurados. Reinicie o PC.", "Reverter") | Out-Null
+                    }
+                }
+                elseif ($global:FragEstadoRuim) {
+                    # sem estado legivel nao da pra saber o que e original. Nao mexe em nada.
+                    [System.Windows.Forms.MessageBox]::Show("O state.json esta ilegivel. Nada foi restaurado.`nCopia salva ao lado dele (.corrompido_data). Conserta ou apaga o arquivo.", "Reverter") | Out-Null
+                }
+                elseif (Test-TabNova $BackupSubDir) {
+                    # ja passou pelo estado novo e nao tem nada ativo. Nao cai no legado
+                    # (reg import velho / padrao chutado mexeria em valor de outra aba).
+                    [System.Windows.Forms.MessageBox]::Show("Essa aba nao tem ajuste ativo pra restaurar.", "Reverter") | Out-Null
                 }
                 elseif (Test-Path $bdir) {
                     # legado: aba que so passou pela versao antiga
-                    Get-ChildItem -Path $bdir -Filter "*.reg" | ForEach-Object { reg.exe import "$($_.FullName)" *> $null }
-                    $guidSalvo = Get-SavedPowerPlan $BackupSubDir
-                    if ($guidSalvo) { powercfg /setactive $guidSalvo }
+                    Restore-Legado $BackupSubDir
                     foreach ($t in $Tweaks) { $t.Control.Checked = [bool](& $t.StatusCheck) }
                     & $refreshInfo
                     [System.Windows.Forms.MessageBox]::Show("Backup restaurado. Reinicie o PC.", "Reverter") | Out-Null
@@ -1249,10 +1456,23 @@ function New-TweaksPanel {
             }
             elseif ($r -eq "No") {
                 if ($ResetDefaults) {
+                    $global:FragResetKind = $null
                     & $ResetDefaults
+                    $kind = $global:FragResetKind
+                    $extra = Get-TextoMantidos
                     foreach ($t in $Tweaks) { $t.Control.Checked = [bool](& $t.StatusCheck) }
                     & $refreshInfo
-                    [System.Windows.Forms.MessageBox]::Show("Resetado pro padrao aproximado. Reinicie o PC.", "Reverter") | Out-Null
+                    # mensagem conforme o que o Reset fez de verdade
+                    $msgReset = switch ($kind) {
+                        "estado" {
+                            if ($extra) { "Restaurado o que so essa aba segurava.`n$extra`nReinicie o PC." }
+                            else { "Valores originais restaurados. Reinicie o PC." }
+                        }
+                        "nada" { "Essa aba nao tem ajuste ativo pra resetar. Nada mudou." }
+                        "erro" { "O state.json esta ilegivel. Nada mudou.`nCopia salva ao lado dele (.corrompido_data). Conserta ou apaga o arquivo." }
+                        default { "Resetado pro padrao aproximado. Reinicie o PC." }
+                    }
+                    [System.Windows.Forms.MessageBox]::Show($msgReset, "Reverter") | Out-Null
                 }
                 else {
                     [System.Windows.Forms.MessageBox]::Show("Sem reset padrao definido pra esta aba - use Sim pra restaurar do backup.", "Reverter") | Out-Null
@@ -1270,6 +1490,8 @@ function New-TweaksPanel {
 
 function New-BoostAction([string]$procName, [string]$backupSub) {
     return {
+        # aba com backup legado: oferece reverter antes de marcar como estado novo
+        if (-not (Confirm-LegadoAntesDeAplicar $backupSub)) { return }
         $msgLines = @()
         $proc = Get-Process -Name $procName -ErrorAction SilentlyContinue
         if ($proc) {
@@ -1279,7 +1501,14 @@ function New-BoostAction([string]$procName, [string]$backupSub) {
             $msgLines += "Jogo nao esta rodando agora"
         }
 
-        Save-PowerPlanOriginal $backupSub
+        if (-not (Save-PowerPlanOriginal $backupSub)) {
+            $motivo = "Confere permissao da pasta global_backup."
+            if ($global:FragEstadoRuim) { $motivo = "O state.json esta ilegivel. Copia salva ao lado dele (.corrompido_data)." }
+            [System.Windows.Forms.MessageBox]::Show("Nao deu pra guardar o plano de energia original. Boost parou aqui. $motivo", "Boost agora") | Out-Null
+            return
+        }
+        # plano original ta no estado: dai em diante a aba e estado novo
+        Set-TabNova $backupSub
         powercfg /setactive SCHEME_MIN | Out-Null
         $msgLines += "Plano de energia: Alto desempenho"
 
@@ -1649,15 +1878,11 @@ $CpuTweaks = @(
             ($t -match "Ultimate Performance") -or ($t -match [regex]::Escape($CPU_ALTO_DESEMPENHO_GUID))
         }
         Apply       = {
-            Save-PowerPlanOriginal "cpu_backup"
-            $guidAlvo = $null
-            $planos = (powercfg /list | Out-String)
-            if ($planos -match "([0-9a-fA-F-]{36})\s*\(Ultimate Performance\)") { $guidAlvo = $Matches[1] }
-            if (-not $guidAlvo) {
-                $dupTxt = (powercfg /duplicatescheme $ULTIMATE_GUID | Out-String)
-                $guidAlvo = Get-Guid $dupTxt
-            }
-            if (-not $guidAlvo) { $guidAlvo = $CPU_ALTO_DESEMPENHO_GUID }
+            if (-not (Save-PowerPlanOriginal "cpu_backup")) { return }
+            $guidAlvo = Get-UltimatePlan
+            # fallback: plano dedicado. O built-in (8c5e7fda...) e do Windows, nao pode mutar.
+            if (-not $guidAlvo) { $guidAlvo = Get-FragBoostPlan }
+            if (-not $guidAlvo) { $global:FragFalha = $true; return }
 
             powercfg /setactive $guidAlvo
             powercfg -setacvalueindex $guidAlvo SUB_PROCESSOR CPMINCORES 100
@@ -1684,11 +1909,13 @@ $CpuTweaks = @(
     @{ Label        = "Power Throttling off + clock travado 100%"
         StatusCheck = { (Get-Reg $CPU_POWERTHROTTLE_KEY "PowerThrottlingOff") -eq 1 }
         Apply       = {
-            Save-PowerPlanOriginal "cpu_backup"
+            if (-not (Save-PowerPlanOriginal "cpu_backup")) { return }
             Backup-Key $CPU_POWERTHROTTLE_KEY "powerthrottling" "cpu_backup"
             Set-Reg $CPU_POWERTHROTTLE_KEY "PowerThrottlingOff" 1
-            $g = Get-GuidAtivo
+            # plano dedicado: setacvalueindex no plano do usuario nunca era desfeito
+            $g = Get-FragBoostPlan
             if ($g) {
+                powercfg /setactive $g
                 powercfg -setacvalueindex $g SUB_PROCESSOR PROCTHROTTLEMAX 100
                 powercfg -setacvalueindex $g SUB_PROCESSOR PROCTHROTTLEMIN 100
                 powercfg -setdcvalueindex $g SUB_PROCESSOR PROCTHROTTLEMAX 100
@@ -1722,7 +1949,10 @@ $CpuTweaks = @(
 )
 
 function Reset-CpuDefaults {
-    if (Restore-Owner "cpu_backup") { return }
+    $global:FragResetKind = "legado"
+    if (Restore-Owner "cpu_backup") { $global:FragResetKind = "estado"; return }
+    if ($global:FragEstadoRuim) { $global:FragResetKind = "erro"; return }
+    if (Test-TabNova "cpu_backup") { $global:FragResetKind = "nada"; return }
     Set-Reg $CPU_PRIORITY_KEY "Win32PrioritySeparation" 2
     Set-Reg $G_MMCSS_KEY "SystemResponsiveness" 20
     Remove-Reg $CPU_POWERTHROTTLE_KEY "PowerThrottlingOff"
@@ -2178,14 +2408,20 @@ function Add-CustomGameTab {
 
     $infoBlock = {
         $achou = if (Test-Path $ExePath) { "Executavel encontrado" } else { "Executavel nao encontrado" }
-        @($achou)
+        $linhas = @($achou)
+        # blocklist tira o item de prioridade de CPU da lista. Sem aviso parece bug.
+        if ($IFEO_BLOCKLIST -contains "$ExeName".ToLower()) {
+            $linhas += "Sem prioridade de CPU: $ExeName e generico demais"
+        }
+        $linhas
     }.GetNewClosure()
 
     $removerAction = {
         $r = [System.Windows.Forms.MessageBox]::Show(
-            "Remover '$Nome' da biblioteca do FragBoost?`n(so tira da lista - nao desinstala nada e nao reverte ajustes ja aplicados)",
+            "Remover '$Nome' da biblioteca do FragBoost?`nReverte os ajustes dele e tira da lista. Nao desinstala nada.",
             "Remover jogo", "YesNo")
         if ($r -eq "Yes") {
+            Restore-Owner $backupSub | Out-Null   # solta o que essa aba segurava
             $Cfg.CustomGames = @($Cfg.CustomGames | Where-Object { $_.Slug -ne $Slug })
             Save-Config $Cfg
             $contentHost.Controls.Remove($TabPanels[$Slug])
